@@ -1,0 +1,70 @@
+import os
+import time
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+DOWNLOAD_DIR = "/Users/avanimanika/Downloads/FinvizDownloads"
+
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+chrome_options = Options()
+chrome_options.add_experimental_option(
+    "prefs",
+    {
+        "download.default_directory": DOWNLOAD_DIR,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+    }
+)
+
+driver = webdriver.Chrome(options=chrome_options)
+
+# Step 1: login
+driver.get("https://elite.finviz.com")
+input("Log in to Finviz Elite in Chrome, then come back here and press ENTER: ")
+
+# Step 2: CSV export link
+CSV_URL = "https://elite.finviz.com/export.ashx?v=111&f=sh_curvol_o100,sh_relvol_o10,ta_change_u"
+
+while True:
+    try:
+        before_files = set(os.listdir(DOWNLOAD_DIR))
+
+        driver.get(CSV_URL)
+
+        start_time = time.time()
+        downloaded = False
+
+        while time.time() - start_time < 30:
+            after_files = set(os.listdir(DOWNLOAD_DIR))
+            new_files = after_files - before_files
+
+            csv_files = [f for f in new_files if f.endswith(".csv")]
+
+            if csv_files:
+                old_file = csv_files[0]
+                old_path = os.path.join(DOWNLOAD_DIR, old_file)
+
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                new_file = f"finviz_scan_{timestamp}.csv"
+                new_path = os.path.join(DOWNLOAD_DIR, new_file)
+
+                os.rename(old_path, new_path)
+
+                print(f"Saved CSV: {new_file}")
+                downloaded = True
+                break
+
+            time.sleep(1)
+
+        if not downloaded:
+            print("No CSV downloaded. Finviz may not be using this export link.")
+
+        print("Waiting 60 seconds...")
+        time.sleep(60)
+
+    except Exception as e:
+        print(f"Error: {e}")
+        time.sleep(60)
