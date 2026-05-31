@@ -1,0 +1,150 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+import io
+from google.colab import files
+from collections import defaultdict
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import json, time
+from curl_cffi import requests as cffi_requests
+
+# ── Upload CSV ────────────────────────────────────────────
+print("Upload your MASK_1min_data.csv file:")
+uploaded = files.upload()
+filename = list(uploaded.keys())[0]
+df = pd.read_csv(io.BytesIO(uploaded[filename]), parse_dates=["date"])
+df = df.sort_values("date").reset_index(drop=True)
+print(f"✅ Loaded price data: {len(df)} rows\n")
+
+# ── Load StockTwits message density from JSON ─────────────
+print("Upload your stocktwits_MASK_rolling JSON file (or skip to re-fetch):")
+try:
+    uploaded2 = files.upload()
+    fname2 = list(uploaded2.keys())[0]
+    data = json.loads(uploaded2[fname2].decode())
+    # Extract per-minute counts from rolling windows
+    # Use window_start and message_count, deduplicate to 1-min resolution
+    seen = {}
+    for w in data["rolling_windows"]:
+        ws = pd.Timestamp(w["window_start"]).tz_localize(None)
+        if ws not in seen:
+            seen[ws] = w["message_count"]
+    msg_times  = sorted(seen.keys())
+    msg_counts = [seen[t] for t in msg_times]
+    print(f"✅ Loaded message density: {len(msg_times)} windows\n")
+    use_json = True
+except:
+    print("No JSON uploaded — will re-fetch from StockTwits\n")
+    use_json = False
+
+# ── Re-fetch if no JSON ───────────────────────────────────
+if not use_json:
+    EDT = ZoneInfo("America/New_York")
+    WINDOW_START = datetime(2026, 5, 28, 4,  0, 0, tzinfo=EDT)
+    WINDOW_END   = datetime(2026, 5, 28, 20, 0, 0, tzinfo=EDT)
+    API_URL = "https://api.stocktwits.com/api/2/streams/symbol/MASK.json"
+    HEADERS = {"Accept": "application/json", "Referer": "https://stocktwits.com/symbol/MASK"}
+
+    def parse_ts(ts): return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    def fetch_page(session, max_id=None):
+        params = {"limit": 30}
+        if max_id: params["max"] = max_id
+        return session.get(API_URL, headers=HEADERS, params=params, timeout=30, impersonate="chrome136").json()
+
+    session, collected, max_id, stop = cffi_requests.Session(), [], None, False
+    page_num = 0
+    while not stop:
+        page_num += 1
+        data = fetch_page(session, max_id)
+        messages = data.get("messages", [])
+        if not messages: break
+        last_dt = parse_ts(messages[-1]["created_at"]).astimezone(EDT)
+        if last_dt > WINDOW_END:
+            max_id = messages[-1]["id"]; time.sleep(0.5); continue
+        for msg in messages:
+            msg_edt = parse_ts(msg["created_at"]).astimezone(EDT)
+            if msg_edt > WINDOW_END: continue
+            if WINDOW_START <= msg_edt <= WINDOW_END:
+                collected.append(msg_edt.replace(tzinfo=None).replace(second=0, microsecond=0))
+            elif msg_edt < WINDOW_START:
+                stop = True; break
+        max_id = messages[-1]["id"]; time.sleep(1.0)
+
+    minute_counts = defaultdict(int)
+    for t in collected: minute_counts[t] += 1
+    msg_times  = sorted(minute_counts.keys())
+    msg_counts = [minute_counts[t] for t in msg_times]
+    print(f"✅ Fetched {len(collected)} messages\n")
+
+# ── Build smoothed message line ───────────────────────────
+window_size = 15
+smoothed = np.convolve(msg_counts, np.ones(window_size)/window_size, mode='same') if len(msg_counts) >= window_size else msg_counts
+
+# ── Plot dual-axis chart ──────────────────────────────────
+fig, ax1 = plt.subplots(figsize=(20, 7))
+
+# ── Left axis: price ──────────────────────────────────────
+color_price = "#2196F3"
+ax1.plot(df["date"], df["close"], color=color_price, linewidth=1.4, label="Close price", zorder=3)
+ax1.fill_between(df["date"], df["close"], df["close"].min(), alpha=0.08, color=color_price)
+ax1.set_ylabel("Close Price ($)", fontsize=12, color=color_price)
+ax1.tick_params(axis="y", labelcolor=color_price)
+ax1.set_ylim(df["close"].min() * 0.97, df["close"].max() * 1.08)
+
+# Price peak/trough
+peak_idx   = df["close"].idxmax()
+trough_idx = df["close"].idxmin()
+ax1.scatter([df.loc[peak_idx,   "date"]], [df.loc[peak_idx,   "close"]], color="green", zorder=6, s=70)
+ax1.annotate(f"High: ${df.loc[peak_idx,'close']:.2f}\n{df.loc[peak_idx,'date'].strftime('%H:%M')}",
+             xy=(df.loc[peak_idx,"date"], df.loc[peak_idx,"close"]),
+             xytext=(10, 10), textcoords="offset points",
+             arrowprops=dict(arrowstyle="->", color="green"), fontsize=9, color="green")
+ax1.scatter([df.loc[trough_idx, "date"]], [df.loc[trough_idx, "close"]], color="red", zorder=6, s=70)
+ax1.annotate(f"Low: ${df.loc[trough_idx,'close']:.2f}\n{df.loc[trough_idx,'date'].strftime('%H:%M')}",
+             xy=(df.loc[trough_idx,"date"], df.loc[trough_idx,"close"]),
+             xytext=(10, -28), textcoords="offset points",
+             arrowprops=dict(arrowstyle="->", color="red"), fontsize=9, color="red")
+
+# ── Right axis: message density ───────────────────────────
+ax2 = ax1.twinx()
+color_msg = "#FF9800"
+ax2.bar(msg_times, msg_counts, width=0.0006, color="#90CAF9", alpha=0.5, label="Messages/min", zorder=2)
+ax2.plot(msg_times, smoothed, color=color_msg, linewidth=2, label="15-min avg density", zorder=4)
+ax2.set_ylabel("Messages per minute", fontsize=12, color=color_msg)
+ax2.tick_params(axis="y", labelcolor=color_msg)
+ax2.set_ylim(bottom=0, top=max(msg_counts) * 2.5)  # keep bars from dominating
+
+# ── Reference lines ───────────────────────────────────────
+def add_vline(time_str, label, color):
+    t = pd.Timestamp(time_str)
+    ax1.axvline(x=t, color=color, linestyle="--", linewidth=1.3, alpha=0.8, label=label)
+
+add_vline("2026-05-28 09:30:00", "Market open (9:30)",     "red")
+add_vline("2026-05-28 16:00:00", "Market close (4:00 PM)", "purple")
+
+# ── X-axis ────────────────────────────────────────────────
+ax1.xaxis.set_major_locator(mdates.MinuteLocator(byminute=[0, 30]))
+ax1.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+ax1.xaxis.set_minor_locator(mdates.MinuteLocator(interval=10))
+plt.xticks(rotation=45, ha="right", fontsize=9)
+
+ax1.set_xlabel("Time (EDT) — tick every 30 mins", fontsize=11)
+ax1.set_xlim(pd.Timestamp("2026-05-28 04:00:00"), pd.Timestamp("2026-05-28 20:00:00"))
+
+# ── Legend (combine both axes) ────────────────────────────
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=9)
+
+ax1.set_title("$MASK — Close Price vs Message Density | May 28, 2026", fontsize=14)
+ax1.grid(axis="y", alpha=0.2)
+ax1.grid(axis="x", alpha=0.1)
+
+plt.tight_layout()
+plt.savefig("MASK_price_vs_density_20260528.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+files.download("MASK_price_vs_density_20260528.png")
+print("Done!")
