@@ -1,0 +1,77 @@
+import requests
+import pandas as pd
+from io import StringIO
+
+ticker = "MASK"
+auth_token = "59ee8f9e-bad1-464d-8330-0948b60f95fa"
+
+url = (
+    f"https://elite.finviz.com/quote_export?"
+    f"t={ticker}"
+    f"&p=i1"
+    f"&s=2026-05-28"
+    f"&e=2026-05-28"
+    f"&auth={auth_token}"
+)
+
+response = requests.get(
+    url,
+    headers={"User-Agent": "Mozilla/5.0"},
+    allow_redirects=True
+)
+
+print("STATUS:", response.status_code)
+print(response.text[:300])
+
+# Load CSV
+df = pd.read_csv(StringIO(response.text))
+
+# Clean column names
+df.columns = [c.strip().lower() for c in df.columns]
+
+print(df.columns)
+
+# Find datetime column
+datetime_col = None
+
+for col in df.columns:
+    if "date" in col or "time" in col:
+        datetime_col = col
+        break
+
+print("Datetime column:", datetime_col)
+
+# Convert datetime
+# Remove trailing AM/PM from all timestamps
+df[datetime_col] = (
+    df[datetime_col]
+    .astype(str)
+    .str.replace(r"\s+(AM|PM)$", "", regex=True)
+)
+
+# Parse as month/day/year 24-hour time
+df[datetime_col] = pd.to_datetime(
+    df[datetime_col],
+    format="%m/%d/%Y %H:%M",
+    errors="coerce"
+)
+
+# Check if any rows failed
+print("Bad timestamps:", df[datetime_col].isna().sum())
+
+
+# Filter desired time range
+filtered_df = df[
+    (df[datetime_col] >= "2026-05-28 04:00:00") &
+    (df[datetime_col] <= "2026-05-28 20:00:00")
+]
+
+# Keep only datetime/open/close
+final_df = filtered_df[[datetime_col, "open", "close"]]
+
+# Save CSV
+final_df.to_csv("MASK_1min_data.csv", index=False)
+
+print(final_df.head())
+
+print("DONE")
