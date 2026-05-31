@@ -1,0 +1,163 @@
+import time
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
+from curl_cffi import requests as cffi_requests
+from collections import defaultdict
+
+# ── Config ───────────────────────────────────────────────
+SYMBOL      = "MASK"
+API_URL     = f"https://api.stocktwits.com/api/2/streams/symbol/{SYMBOL}.json"
+EDT         = ZoneInfo("America/New_York")
+GRAPH_FILE  = f"stocktwits_{SYMBOL}_density_20260528.png"
+
+WINDOW_START = datetime(2026, 5, 28, 4,  0, 0, tzinfo=EDT)
+WINDOW_END   = datetime(2026, 5, 28, 20, 0, 0, tzinfo=EDT)
+
+HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": f"https://stocktwits.com/symbol/{SYMBOL}",
+    "Origin": "https://stocktwits.com",
+}
+
+# ── Helpers ───────────────────────────────────────────────
+def parse_ts(ts_str):
+    return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+def fetch_page(session, max_id=None):
+    params = {"limit": 30}
+    if max_id is not None:
+        params["max"] = max_id
+    resp = session.get(API_URL, headers=HEADERS, params=params,
+                       timeout=30, impersonate="chrome136")
+    resp.raise_for_status()
+    return resp.json()
+
+# ── STEP 1: Fetch ─────────────────────────────────────────
+print(f"Fetching $MASK | {WINDOW_START.strftime('%H:%M')} → {WINDOW_END.strftime('%H:%M')} EDT on 2026-05-28\n")
+
+session   = cffi_requests.Session()
+collected = []
+max_id    = None
+stop      = False
+page_num  = 0
+
+while not stop:
+    page_num += 1
+    try:
+        data = fetch_page(session, max_id)
+    except Exception as e:
+        print(f"Request error: {e}"); break
+
+    messages = data.get("messages", [])
+    if not messages:
+        print("No messages — stopping."); break
+
+    first_dt = parse_ts(messages[0]["created_at"]).astimezone(EDT)
+    last_dt  = parse_ts(messages[-1]["created_at"]).astimezone(EDT)
+    print(f"Page {page_num:>4} | {first_dt.strftime('%H:%M:%S')} → {last_dt.strftime('%H:%M:%S')} EDT | collected: {len(collected)}")
+
+    if last_dt > WINDOW_END:
+        max_id = messages[-1]["id"]
+        time.sleep(0.5)
+        continue
+
+    for msg in messages:
+        msg_utc = parse_ts(msg["created_at"])
+        msg_edt = msg_utc.astimezone(EDT)
+
+        if msg_edt > WINDOW_END:
+            continue
+        if WINDOW_START <= msg_edt <= WINDOW_END:
+            collected.append(msg_edt)
+        elif msg_edt < WINDOW_START:
+            print(f"\n  Passed 4:00 AM — stopping.")
+            stop = True
+            break
+
+    max_id = messages[-1]["id"]
+    time.sleep(1.0)
+
+print(f"\n✅ Collected {len(collected)} messages\n")
+
+# ── STEP 2: Bucket by minute ──────────────────────────────
+# Count messages per exact minute across the full window
+minute_counts = defaultdict(int)
+for msg_edt in collected:
+    bucket = msg_edt.replace(second=0, microsecond=0)
+    minute_counts[bucket] += 1
+
+# Build complete minute-by-minute timeline (even empty minutes = 0)
+all_minutes = []
+t = WINDOW_START.replace(second=0, microsecond=0)
+while t <= WINDOW_END:
+    all_minutes.append(t)
+    t += timedelta(minutes=1)
+
+x_times  = all_minutes
+y_counts = [minute_counts.get(m, 0) for m in all_minutes]
+
+# ── STEP 3: Plot ──────────────────────────────────────────
+print("Plotting graph...")
+
+fig, ax = plt.subplots(figsize=(18, 6))
+
+# Bar chart — one bar per minute, looks cleaner than a line for per-minute density
+ax.bar(x_times, y_counts, width=0.0006, color="#4f8ef7", alpha=0.8, label="Messages per minute")
+
+# Overlay smoothed line (15-min rolling average) so trend is visible
+import numpy as np
+window_size = 15
+if len(y_counts) >= window_size:
+    smoothed = np.convolve(y_counts, np.ones(window_size)/window_size, mode='same')
+    ax.plot(x_times, smoothed, color="orange", linewidth=2,
+            label=f"{window_size}-min rolling avg", zorder=5)
+
+# Key time markers
+def add_vline(hour, minute, label, color):
+    t = datetime(2026, 5, 28, hour, minute, 0, tzinfo=EDT)
+    if WINDOW_START <= t <= WINDOW_END:
+        ax.axvline(x=t, color=color, linestyle="--", linewidth=1.2, alpha=0.8, label=label)
+
+add_vline(4,  0,  "Pre-market open (4:00)",  "green")
+add_vline(9,  30, "Market open (9:30)",       "red")
+add_vline(16, 0,  "Market close (4:00 PM)",   "purple")
+
+# Peak annotation
+if max(y_counts) > 0:
+    peak_idx   = y_counts.index(max(y_counts))
+    peak_time  = x_times[peak_idx]
+    peak_count = y_counts[peak_idx]
+    ax.annotate(
+        f"Peak: {peak_count} msgs\n{peak_time.strftime('%H:%M')} EDT",
+        xy=(peak_time, peak_count),
+        xytext=(25, 10), textcoords="offset points",
+        arrowprops=dict(arrowstyle="->", color="red"),
+        fontsize=9, color="red"
+    )
+    ax.scatter([peak_time], [peak_count], color="red", zorder=6, s=50)
+
+# X-axis: tick every 30 minutes so it's clean, not messy
+ax.xaxis.set_major_locator(mdates.MinuteLocator(byminute=[0, 30]))
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=EDT))
+ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=10))
+plt.xticks(rotation=45, ha="right", fontsize=9)
+
+ax.set_xlabel("Time (EDT) — tick every 30 mins", fontsize=11)
+ax.set_ylabel("Messages per minute", fontsize=11)
+ax.set_title(f"$MASK StockTwits Message Density | May 28, 2026  04:00–20:00 EDT", fontsize=13)
+ax.legend(fontsize=9)
+ax.grid(axis="y", alpha=0.25)
+ax.grid(axis="x", alpha=0.1)
+ax.set_xlim(WINDOW_START, WINDOW_END)
+ax.set_ylim(bottom=0)
+
+plt.tight_layout()
+plt.savefig(GRAPH_FILE, dpi=150, bbox_inches="tight")
+plt.show()
+
+from google.colab import files
+files.download(GRAPH_FILE)
+print(f"\nGraph saved → {GRAPH_FILE}")
