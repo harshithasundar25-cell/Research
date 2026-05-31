@@ -1,0 +1,87 @@
+import os
+import time
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+DOWNLOAD_DIR = "/Users/avanimanika/Downloads/FinvizDownloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+URLS = {
+    "mega": "https://elite.finviz.com/export?v=111&f=cap_mega%2Csh_curvol_o5000%2Csh_relvol_o1.5&auth=59ee8f9e-bad1-464d-8330-0948b60f95fa",
+
+    "large": "https://elite.finviz.com/export?v=111&f=cap_large%2Csh_curvol_o5000%2Csh_relvol_3.5to&auth=59ee8f9e-bad1-464d-8330-0948b60f95fa",
+
+    "mid": "https://elite.finviz.com/export?v=111&f=cap_mid%2Csh_curvol_o1000%2Csh_relvol_3to&auth=59ee8f9e-bad1-464d-8330-0948b60f95fa",
+
+    "small": "https://elite.finviz.com/export?v=111&f=cap_small%2Csh_curvol_o500%2Csh_relvol_3.5to&auth=59ee8f9e-bad1-464d-8330-0948b60f95fa",
+
+    "micro": "https://elite.finviz.com/export?v=111&f=cap_micro%2Csh_curvol_o100%2Csh_relvol_3.3to&auth=59ee8f9e-bad1-464d-8330-0948b60f95fa",
+
+    "nano": "https://elite.finviz.com/export?v=111&f=cap_nano%2Csh_curvol_o750%2Csh_relvol_5to&auth=59ee8f9e-bad1-464d-8330-0948b60f95fa"
+}
+
+chrome_options = Options()
+chrome_options.add_experimental_option(
+    "prefs",
+    {
+        "download.default_directory": DOWNLOAD_DIR,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+    }
+)
+
+driver = webdriver.Chrome(options=chrome_options)
+
+driver.get("https://elite.finviz.com")
+input("Log in to Finviz Elite, then come back to PyCharm and press ENTER: ")
+
+
+def wait_for_download_and_rename(before_files, new_name):
+    start_time = time.time()
+
+    while time.time() - start_time < 30:
+        after_files = set(os.listdir(DOWNLOAD_DIR))
+        new_files = after_files - before_files
+
+        csv_files = [
+            file for file in new_files
+            if file.endswith(".csv")
+        ]
+
+        if csv_files:
+            old_file = csv_files[0]
+            old_path = os.path.join(DOWNLOAD_DIR, old_file)
+            new_path = os.path.join(DOWNLOAD_DIR, new_name)
+
+            os.rename(old_path, new_path)
+            print(f"Saved: {new_name}")
+            return True
+
+        time.sleep(1)
+
+    print(f"No CSV downloaded for {new_name}")
+    return False
+
+
+while True:
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    loop_start_time = time.time()
+
+    for market_cap_name, url in URLS.items():
+        before_files = set(os.listdir(DOWNLOAD_DIR))
+
+        driver.get(url)
+
+        filename = f"{market_cap_name}_{timestamp}.csv"
+
+        wait_for_download_and_rename(before_files, filename)
+
+        time.sleep(2)
+
+    elapsed_time = time.time() - loop_start_time
+    wait_time = max(0, 60 - elapsed_time)
+
+    print(f"Finished all market caps for {timestamp}. Waiting {round(wait_time)} seconds...")
+    time.sleep(wait_time)
