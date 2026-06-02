@@ -1,0 +1,200 @@
+import os
+import time
+from datetime import datetime
+from urllib.parse import quote
+
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+FINAL_DIR = "/Users/avanimanika/Downloads/FinvizDownloads"
+TEMP_DIR = "/Users/avanimanika/Downloads/FinvizDownloads/temp"
+
+os.makedirs(FINAL_DIR, exist_ok=True)
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+AUTH = "59ee8f9e-bad1-464d-8330-0948b60f95fa"
+TARGET_TICKERS = 30
+
+RAW_CAP_FILTERS = {
+    "mega": "cap_mega",
+    "large": "cap_large",
+    "mid": "cap_mid",
+    "small": "cap_small",
+    "micro": "cap_micro",
+    "nano": "cap_nano",
+}
+
+CHANGE_FILTERS = {
+    "mega": "ta_change_u1",
+    "large": "ta_change_u1",
+    "mid": "ta_change_u5",
+    "small": "ta_change_u5",
+    "micro": "ta_change_u10",
+    "nano": "ta_change_u10",
+}
+
+CURRENT_VOLUME = "sh_curvol_o100"
+
+RELATIVE_VOLUME_OPTIONS = [
+    "sh_relvol_o0.75",
+    "sh_relvol_o1",
+    "sh_relvol_o1.5",
+    "sh_relvol_o2",
+    "sh_relvol_o3",
+    "sh_relvol_o5",
+    "sh_relvol_o10",
+]
+
+previous_tickers = {}
+
+chrome_options = Options()
+chrome_options.add_experimental_option(
+    "prefs",
+    {
+        "download.default_directory": TEMP_DIR,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+    }
+)
+
+driver = webdriver.Chrome(options=chrome_options)
+
+driver.get("https://elite.finviz.com")
+input("Log in to Finviz Elite, then come back to PyCharm and press ENTER: ")
+
+
+def clean_temp_folder():
+    for file in os.listdir(TEMP_DIR):
+        path = os.path.join(TEMP_DIR, file)
+        if os.path.isfile(path):
+            os.remove(path)
+
+
+def build_export_url(market_cap_name, relvol_filter):
+    filters = [
+        RAW_CAP_FILTERS[market_cap_name],
+        CURRENT_VOLUME,
+        relvol_filter,
+        CHANGE_FILTERS[market_cap_name],
+    ]
+
+    filter_string = ",".join(filters)
+    encoded_filters = quote(filter_string, safe="")
+
+    return f"https://elite.finviz.com/export?v=111&f={encoded_filters}&ft=3&auth={AUTH}"
+
+
+def wait_for_download():
+    start_time = time.time()
+
+    while time.time() - start_time < 30:
+        csv_files = [
+            f for f in os.listdir(TEMP_DIR)
+            if f.endswith(".csv")
+        ]
+
+        if csv_files:
+            return os.path.join(TEMP_DIR, csv_files[0])
+
+        time.sleep(1)
+
+    return None
+
+
+def count_tickers(csv_path):
+    try:
+        df = pd.read_csv(csv_path)
+
+        if "Ticker" not in df.columns:
+            return 0, set()
+
+        tickers = set(df["Ticker"].dropna().astype(str))
+        return len(tickers), tickers
+
+    except Exception:
+        return 0, set()
+
+
+def get_status(market_cap_name, current_tickers):
+    if market_cap_name not in previous_tickers:
+        previous_tickers[market_cap_name] = current_tickers
+        return "first"
+
+    old_tickers = previous_tickers[market_cap_name]
+
+    added = current_tickers - old_tickers
+    dropped = old_tickers - current_tickers
+
+    previous_tickers[market_cap_name] = current_tickers
+
+    if added and dropped:
+        return "added_dropped"
+    elif added:
+        return "added"
+    elif dropped:
+        return "dropped"
+    else:
+        return "same"
+
+
+while True:
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    loop_start_time = time.time()
+
+    for market_cap_name in RAW_CAP_FILTERS.keys():
+        best_file = None
+        best_count = None
+        best_tickers = set()
+
+        for relvol_filter in RELATIVE_VOLUME_OPTIONS:
+            clean_temp_folder()
+
+            url = build_export_url(market_cap_name, relvol_filter)
+            driver.get(url)
+
+            downloaded_path = wait_for_download()
+
+            if not downloaded_path:
+                print(f"No CSV downloaded for {market_cap_name} using {relvol_filter}")
+                continue
+
+            ticker_count, tickers = count_tickers(downloaded_path)
+
+            print(f"{market_cap_name}: {ticker_count} tickers using {relvol_filter}")
+
+            if best_count is None or abs(ticker_count - TARGET_TICKERS) < abs(best_count - TARGET_TICKERS):
+                best_count = ticker_count
+                best_tickers = tickers
+
+                best_file = os.path.join(FINAL_DIR, f"BEST_TEMP_{market_cap_name}.csv")
+
+                if os.path.exists(best_file):
+                    os.remove(best_file)
+
+                os.rename(downloaded_path, best_file)
+
+            time.sleep(1)
+
+        if best_file and os.path.exists(best_file):
+            status = get_status(market_cap_name, best_tickers)
+
+            final_filename = f"{market_cap_name}_{status}_{timestamp}.csv"
+            final_path = os.path.join(FINAL_DIR, final_filename)
+
+            if os.path.exists(final_path):
+                os.remove(final_path)
+
+            os.rename(best_file, final_path)
+
+            print(f"Saved FINAL: {final_filename}")
+
+        clean_temp_folder()
+        time.sleep(2)
+
+    elapsed_time = time.time() - loop_start_time
+    wait_time = max(0, 60 - elapsed_time)
+
+    print(f"Finished scan for {timestamp}. Waiting {round(wait_time)} seconds...")
+    time.sleep(wait_time)
