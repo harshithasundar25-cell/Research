@@ -1,0 +1,370 @@
+!pip install curl_cffi -q
+import time, io, requests
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from curl_cffi import requests as cffi_requests
+from collections import defaultdict
+from scipy import stats
+from io import StringIO
+from urllib.parse import urlparse, parse_qs
+from google.colab import files
+
+# ════════════════════════════════════════════════════════════
+# STEP 1 — USER INPUT
+# ════════════════════════════════════════════════════════════
+AUTH_TOKEN = "59ee8f9e-bad1-464d-8330-0948b60f95fa"
+
+finviz_link = input("Finviz link (or press Enter to type ticker manually): ").strip()
+if finviz_link:
+    try:
+        TICKER = parse_qs(urlparse(finviz_link).query)["t"][0].upper()
+    except:
+        raise Exception("Could not find ticker in Finviz URL.")
+else:
+    TICKER = input("Ticker: ").strip().upper()
+
+DATE_STR   = input("Date (YYYY-MM-DD): ").strip()
+START_TIME = input("Start time (HH:MM, 24h): ").strip()
+END_TIME   = input("End time   (HH:MM, 24h): ").strip()
+
+print(f"\n✅ Running: ${TICKER} | {DATE_STR} | {START_TIME}–{END_TIME}\n")
+
+# ════════════════════════════════════════════════════════════
+# STEP 2 — FETCH PRICE FROM FINVIZ
+# ════════════════════════════════════════════════════════════
+url = (
+    f"https://elite.finviz.com/quote_export?"
+    f"t={TICKER}&p=i1&s={DATE_STR}&e={DATE_STR}"
+    f"&auth={AUTH_TOKEN}"
+)
+print("Fetching price from Finviz...")
+resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+print(f"Status: {resp.status_code}")
+
+df_raw = pd.read_csv(StringIO(resp.text))
+df_raw.columns = [c.strip().lower() for c in df_raw.columns]
+
+datetime_col = next((c for c in df_raw.columns if "date" in c or "time" in c), None)
+if datetime_col is None:
+    raise Exception("No datetime column found in Finviz response.")
+
+df_raw[datetime_col] = (
+    df_raw[datetime_col].astype(str)
+    .str.replace(r"\s+(AM|PM)$", "", regex=True)
+)
+df_raw[datetime_col] = pd.to_datetime(
+    df_raw[datetime_col], format="%m/%d/%Y %H:%M", errors="coerce"
+)
+df_raw = df_raw.dropna(subset=[datetime_col])
+
+start_dt = pd.Timestamp(f"{DATE_STR} {START_TIME}:00")
+end_dt   = pd.Timestamp(f"{DATE_STR} {END_TIME}:00")
+df_price = df_raw[(df_raw[datetime_col] >= start_dt) & (df_raw[datetime_col] <= end_dt)].copy()
+df_price = df_price.rename(columns={datetime_col: "date"})
+df_price = df_price[["date", "close"]].sort_values("date").reset_index(drop=True)
+
+print(f"✅ Price rows: {len(df_price)} | {df_price['date'].min().strftime('%H:%M')} → {df_price['date'].max().strftime('%H:%M')}\n")
+if len(df_price) == 0:
+    raise RuntimeError("No price data returned. Check ticker/date/token.")
+
+# ════════════════════════════════════════════════════════════
+# STEP 3 — FETCH STOCKTWITS MESSAGES
+# ════════════════════════════════════════════════════════════
+EDT          = ZoneInfo("America/New_York")
+date_parts   = [int(x) for x in DATE_STR.split("-")]
+WINDOW_START = datetime(date_parts[0], date_parts[1], date_parts[2],
+                        int(START_TIME.split(":")[0]), int(START_TIME.split(":")[1]), 0, tzinfo=EDT)
+WINDOW_END   = datetime(date_parts[0], date_parts[1], date_parts[2],
+                        int(END_TIME.split(":")[0]),   int(END_TIME.split(":")[1]),   0, tzinfo=EDT)
+
+API_URL = f"https://api.stocktwits.com/api/2/streams/symbol/{TICKER}.json"
+HEADERS = {
+    "Accept":  "application/json, text/plain, */*",
+    "Referer": f"https://stocktwits.com/symbol/{TICKER}",
+    "Origin":  "https://stocktwits.com",
+}
+
+def parse_ts(ts_str):
+    return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+def extract_sentiment(msg):
+    raw = msg.get("entities", {}).get("sentiment", None)
+    return raw.get("basic", "None") if raw else "None"
+
+def fetch_page(session, max_id=None):
+    params = {"limit": 30}
+    if max_id is not None:
+        params["max"] = max_id
+    r = session.get(API_URL, headers=HEADERS, params=params,
+                    timeout=30, impersonate="chrome136")
+    r.raise_for_status()
+    return r.json()
+
+print(f"Fetching ${TICKER} messages from StockTwits | {WINDOW_START.strftime('%H:%M')} → {WINDOW_END.strftime('%H:%M')} EDT\n")
+session, collected, max_id, stop, page_num = cffi_requests.Session(), [], None, False, 0
+
+while not stop:
+    page_num += 1
+    try:
+        data = fetch_page(session, max_id)
+    except Exception as e:
+        print(f"Error: {e}"); break
+    messages = data.get("messages", [])
+    if not messages:
+        print("No messages — stopping."); break
+
+    first_dt = parse_ts(messages[0]["created_at"]).astimezone(EDT)
+    last_dt  = parse_ts(messages[-1]["created_at"]).astimezone(EDT)
+    print(f"Page {page_num:>4} | {first_dt.strftime('%H:%M:%S')} → {last_dt.strftime('%H:%M:%S')} | collected: {len(collected)}")
+
+    if last_dt > WINDOW_END:
+        max_id = messages[-1]["id"]; time.sleep(0.5); continue
+
+    for msg in messages:
+        msg_edt = parse_ts(msg["created_at"]).astimezone(EDT)
+        if msg_edt > WINDOW_END: continue
+        if WINDOW_START <= msg_edt <= WINDOW_END:
+            collected.append({
+                "_ts_edt":   msg_edt.replace(tzinfo=None).replace(second=0, microsecond=0),
+                "sentiment": extract_sentiment(msg),
+            })
+        elif msg_edt < WINDOW_START:
+            print(f"\n  Passed {START_TIME} — stopping.")
+            stop = True; break
+
+    max_id = messages[-1]["id"]
+    time.sleep(1.0)
+
+print(f"\n✅ Collected {len(collected)} messages")
+if len(collected) == 0:
+    raise RuntimeError("No messages found for this ticker/date/time range.")
+
+# ════════════════════════════════════════════════════════════
+# STEP 4 — BUILD ROLLING WINDOWS (5-min, slides 1 min)
+# ════════════════════════════════════════════════════════════
+minute_counts = defaultdict(int)
+minute_bull   = defaultdict(int)
+minute_bear   = defaultdict(int)
+for m in collected:
+    t = m["_ts_edt"]
+    minute_counts[t] += 1
+    if m["sentiment"] == "Bullish": minute_bull[t] += 1
+    if m["sentiment"] == "Bearish": minute_bear[t] += 1
+
+print("\nBuilding 5-min rolling windows...")
+windows = []
+t = WINDOW_START.replace(tzinfo=None)
+t_end = WINDOW_END.replace(tzinfo=None)
+
+while t + timedelta(minutes=5) <= t_end:
+    wend   = t + timedelta(minutes=5)
+    keys   = [k for k in minute_counts if t <= k < wend]
+    total  = sum(minute_counts[k] for k in keys)
+    bull   = sum(minute_bull[k]   for k in keys)
+    bear   = sum(minute_bear[k]   for k in keys)
+    tagged = bull + bear
+    raw    = (bull - bear) / tagged if tagged > 0 else 0.0
+    windows.append({
+        "t":        t,
+        "total":    total,
+        "weighted": raw * np.log1p(total),
+    })
+    t += timedelta(minutes=1)
+
+max_w = max(abs(w["weighted"]) for w in windows) or 1.0
+for w in windows:
+    w["norm_score"] = w["weighted"] / max_w
+
+win_df = pd.DataFrame({
+    "minute":     pd.to_datetime([w["t"]          for w in windows]),
+    "density":    [w["total"]      for w in windows],
+    "norm_score": [w["norm_score"] for w in windows],
+})
+print(f"Built {len(windows)} windows\n")
+
+# ════════════════════════════════════════════════════════════
+# STEP 5 — ALIGN & SMOOTH
+# ════════════════════════════════════════════════════════════
+df_price["minute"] = df_price["date"].dt.floor("min")
+df = pd.merge(df_price[["date", "minute", "close"]], win_df, on="minute", how="inner")
+df = df.dropna(subset=["close"]).reset_index(drop=True)
+
+if len(df) == 0:
+    raise RuntimeError("No overlapping data between price and messages. Check date/time range.")
+if df["density"].max() == 0:
+    raise RuntimeError("Density is all zeros — no messages matched the price timestamps.")
+
+def smooth(arr, k=10):
+    if len(arr) < k: return list(arr)
+    return np.convolve(arr, np.ones(k)/k, mode='same').tolist()
+
+df["price_smooth"]   = smooth(df["close"].values,      k=5)
+df["density_smooth"] = smooth(df["density"].values,    k=10)
+df["score_smooth"]   = smooth(df["norm_score"].values, k=10)
+
+# ════════════════════════════════════════════════════════════
+# STEP 6 — CORRELATIONS
+# ════════════════════════════════════════════════════════════
+def safe_r(a, b):
+    a, b = np.array(a), np.array(b)
+    if a.std() > 0 and b.std() > 0:
+        r, p = stats.pearsonr(a, b)
+        return round(r, 3), round(p, 5)
+    return 0.0, 1.0
+
+r_pd, p_pd = safe_r(df["density_smooth"], df["price_smooth"])
+r_ps, p_ps = safe_r(df["score_smooth"],   df["price_smooth"])
+r_ds, p_ds = safe_r(df["density_smooth"], df["score_smooth"])
+
+print(f"r(price vs density)     = {r_pd:+.3f}  p={p_pd:.2e}")
+print(f"r(price vs sentiment)   = {r_ps:+.3f}  p={p_ps:.2e}")
+print(f"r(density vs sentiment) = {r_ds:+.3f}  p={p_ds:.2e}\n")
+
+# Rolling 30-min r
+WIN_R = 30
+win_r_ps, win_r_pd, win_r_t = [], [], []
+for i in range(WIN_R, len(df)):
+    sl = df.iloc[i-WIN_R:i]
+    r1, _ = safe_r(sl["score_smooth"],   sl["price_smooth"])
+    r2, _ = safe_r(sl["density_smooth"], sl["price_smooth"])
+    win_r_ps.append(r1)
+    win_r_pd.append(r2)
+    win_r_t.append(df["date"].iloc[i])
+
+# ════════════════════════════════════════════════════════════
+# STEP 7 — PLOT ALL 3 GRAPHS IN ONE PNG
+# ════════════════════════════════════════════════════════════
+color_p, color_d, color_s = "#1565C0", "#FF6F00", "#2E7D32"
+
+def add_vlines(ax):
+    for h, m, label, color in [
+        (9,  30, "Market open (9:30)",     "red"),
+        (16,  0, "Market close (4:00 PM)", "purple"),
+    ]:
+        tp = pd.Timestamp(f"{DATE_STR} {h:02d}:{m:02d}")
+        if df["date"].min() <= tp <= df["date"].max():
+            ax.axvline(x=tp, color=color, linestyle="--",
+                       linewidth=1.3, alpha=0.8, label=label)
+
+def fmt_x(ax):
+    ax.xaxis.set_major_locator(mdates.MinuteLocator(byminute=[0, 30]))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=10))
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
+    ax.set_xlim(df["date"].min(), df["date"].max())
+
+fig, (ax1, ax2, ax3) = plt.subplots(
+    3, 1, figsize=(22, 18),
+    gridspec_kw={"height_ratios": [2.5, 1.5, 1.5]}
+)
+fig.suptitle(
+    f"${TICKER} — Price · Density · Sentiment | {DATE_STR}  {START_TIME}–{END_TIME} EDT\n"
+    f"5-min rolling window  |  r(price/density)={r_pd:+.3f}  "
+    f"r(price/sentiment)={r_ps:+.3f}  r(density/sentiment)={r_ds:+.3f}",
+    fontsize=13, y=1.01
+)
+
+# ── Graph 1: all 3 signals ────────────────────────────────
+ax1_d = ax1.twinx()
+ax1_s = ax1.twinx()
+ax1_s.spines["right"].set_position(("axes", 1.06))
+
+ax1.plot(df["date"], df["close"], color=color_p, linewidth=1.8,
+         label="Close price", zorder=5)
+ax1.fill_between(df["date"], df["close"], df["close"].min(),
+                 alpha=0.07, color=color_p)
+
+ax1_d.bar(df["date"], df["density"], width=0.0006,
+          color=color_d, alpha=0.25, label="Msgs/min (raw)")
+ax1_d.plot(df["date"], df["density_smooth"], color=color_d,
+           linewidth=1.8, label="Density (10-min avg)", zorder=4)
+
+ax1_s.fill_between(df["date"], df["score_smooth"], 0,
+                   where=[v >= 0 for v in df["score_smooth"]],
+                   alpha=0.15, color="green")
+ax1_s.fill_between(df["date"], df["score_smooth"], 0,
+                   where=[v <  0 for v in df["score_smooth"]],
+                   alpha=0.15, color="red")
+ax1_s.plot(df["date"], df["score_smooth"], color=color_s,
+           linewidth=1.8, label="Norm. sentiment", zorder=6)
+ax1_s.axhline(0, color="black", linewidth=0.7, alpha=0.4)
+
+add_vlines(ax1)
+ax1.set_ylabel("Close Price ($)",           fontsize=11, color=color_p)
+ax1_d.set_ylabel("Messages / 5-min window", fontsize=11, color=color_d)
+ax1_s.set_ylabel("Norm. Sentiment (−1→+1)", fontsize=11, color=color_s)
+ax1.tick_params(axis="y", labelcolor=color_p)
+ax1_d.tick_params(axis="y", labelcolor=color_d)
+ax1_s.tick_params(axis="y", labelcolor=color_s)
+ax1_d.set_ylim(bottom=0, top=max(df["density"].max() * 3, 1))
+ax1_s.set_ylim(-1.5, 1.5)
+fmt_x(ax1)
+ax1.set_title("Price · Message Density · Normalized Sentiment", fontsize=12)
+
+l1, lb1 = ax1.get_legend_handles_labels()
+l2, lb2 = ax1_d.get_legend_handles_labels()
+l3, lb3 = ax1_s.get_legend_handles_labels()
+ax1.legend(l1+l2+l3, lb1+lb2+lb3, fontsize=8, loc="upper left")
+ax1.grid(axis="y", alpha=0.2); ax1.grid(axis="x", alpha=0.1)
+
+box = (
+    f"r(price vs density)     = {r_pd:+.3f}\n"
+    f"r(price vs sentiment)   = {r_ps:+.3f}\n"
+    f"r(density vs sentiment) = {r_ds:+.3f}"
+)
+ax1.text(0.99, 0.97, box, transform=ax1.transAxes,
+         fontsize=9, va="top", ha="right", family="monospace",
+         bbox=dict(boxstyle="round,pad=0.5", facecolor="lightyellow", alpha=0.95))
+
+# ── Graph 2: r(price vs sentiment) over time ─────────────
+ax2.fill_between(win_r_t, win_r_ps, 0,
+                 where=[v >= 0 for v in win_r_ps],
+                 alpha=0.25, color="green", label="Positive correlation")
+ax2.fill_between(win_r_t, win_r_ps, 0,
+                 where=[v <  0 for v in win_r_ps],
+                 alpha=0.25, color="red",   label="Negative correlation")
+ax2.plot(win_r_t, win_r_ps, color=color_s, linewidth=2,
+         label=f"r(price vs sentiment)  overall={r_ps:+.3f}")
+ax2.axhline(0,    color="black", linewidth=1,   alpha=0.5)
+ax2.axhline( 0.5, color="gray",  linewidth=0.8, linestyle=":", alpha=0.6, label="r = ±0.5")
+ax2.axhline(-0.5, color="gray",  linewidth=0.8, linestyle=":", alpha=0.6)
+add_vlines(ax2)
+fmt_x(ax2)
+ax2.set_ylabel("Pearson r", fontsize=11)
+ax2.set_title("Rolling 30-min r: Price vs Normalized Sentiment", fontsize=12)
+ax2.set_ylim(-1.1, 1.1)
+ax2.legend(fontsize=9, loc="upper right")
+ax2.grid(axis="y", alpha=0.2); ax2.grid(axis="x", alpha=0.1)
+
+# ── Graph 3: r(price vs density) over time ───────────────
+ax3.fill_between(win_r_t, win_r_pd, 0,
+                 where=[v >= 0 for v in win_r_pd],
+                 alpha=0.25, color="green", label="Positive correlation")
+ax3.fill_between(win_r_t, win_r_pd, 0,
+                 where=[v <  0 for v in win_r_pd],
+                 alpha=0.25, color="red",   label="Negative correlation")
+ax3.plot(win_r_t, win_r_pd, color=color_d, linewidth=2,
+         label=f"r(price vs density)  overall={r_pd:+.3f}")
+ax3.axhline(0,    color="black", linewidth=1,   alpha=0.5)
+ax3.axhline( 0.5, color="gray",  linewidth=0.8, linestyle=":", alpha=0.6, label="r = ±0.5")
+ax3.axhline(-0.5, color="gray",  linewidth=0.8, linestyle=":", alpha=0.6)
+add_vlines(ax3)
+fmt_x(ax3)
+ax3.set_xlabel("Time (EDT) — tick every 30 mins", fontsize=11)
+ax3.set_ylabel("Pearson r", fontsize=11)
+ax3.set_title("Rolling 30-min r: Price vs Message Density", fontsize=12)
+ax3.set_ylim(-1.1, 1.1)
+ax3.legend(fontsize=9, loc="upper right")
+ax3.grid(axis="y", alpha=0.2); ax3.grid(axis="x", alpha=0.1)
+
+plt.tight_layout()
+out = f"{TICKER}_{DATE_STR}_{START_TIME.replace(':','')}_{END_TIME.replace(':','')}_analysis.png"
+plt.savefig(out, dpi=150, bbox_inches="tight")
+plt.show()
+
+files.download(out)
+print(f"\n✅ Done! Saved → {out}")
