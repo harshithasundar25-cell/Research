@@ -1,0 +1,123 @@
+import requests
+import pandas as pd
+from io import StringIO
+from urllib.parse import urlparse, parse_qs
+
+# Your Finviz API token
+AUTH_TOKEN = "YOUR_TOKEN_HERE"
+
+# ----------------------------
+# USER INPUT
+# ----------------------------
+
+finviz_link = input(
+    "Finviz link (or press Enter to type ticker manually): "
+).strip()
+
+if finviz_link:
+    try:
+        ticker = parse_qs(urlparse(finviz_link).query)["t"][0]
+    except:
+        raise Exception("Could not find ticker in Finviz URL.")
+else:
+        ticker = input("Ticker: ").strip().upper()
+
+target_date = input(
+    "Date (YYYY-MM-DD): "
+).strip()
+
+start_time = input(
+    "Start time (HH:MM, 24-hour): "
+).strip()
+
+end_time = input(
+    "End time (HH:MM, 24-hour): "
+).strip()
+
+# ----------------------------
+# DOWNLOAD DATA
+# ----------------------------
+
+url = (
+    f"https://elite.finviz.com/quote_export?"
+    f"t={ticker}"
+    f"&p=i1"
+    f"&s={target_date}"
+    f"&e={target_date}"
+    f"&auth=59ee8f9e-bad1-464d-8330-0948b60f95fa"
+)
+
+print("\nDownloading...")
+print(url)
+
+response = requests.get(
+    url,
+    headers={"User-Agent": "Mozilla/5.0"},
+    allow_redirects=True
+)
+
+print("Status:", response.status_code)
+
+df = pd.read_csv(StringIO(response.text))
+
+# ----------------------------
+# CLEAN DATA
+# ----------------------------
+
+df.columns = [c.strip().lower() for c in df.columns]
+
+datetime_col = None
+
+for col in df.columns:
+    if "date" in col or "time" in col:
+        datetime_col = col
+        break
+
+if datetime_col is None:
+    raise Exception("No datetime column found")
+
+# Fix Finviz's weird PM formatting
+df[datetime_col] = (
+    df[datetime_col]
+    .astype(str)
+    .str.replace(r"\s+(AM|PM)$", "", regex=True)
+)
+
+df[datetime_col] = pd.to_datetime(
+    df[datetime_col],
+    format="%m/%d/%Y %H:%M",
+    errors="coerce"
+)
+
+df = df.dropna(subset=[datetime_col])
+
+# ----------------------------
+# FILTER TIME RANGE
+# ----------------------------
+
+start_dt = f"{target_date} {start_time}:00"
+end_dt = f"{target_date} {end_time}:00"
+
+filtered_df = df[
+    (df[datetime_col] >= start_dt) &
+    (df[datetime_col] <= end_dt)
+]
+
+# ----------------------------
+# EXPORT
+# ----------------------------
+
+# Keep only datetime and close
+final_df = filtered_df[[datetime_col, "close"]]
+
+output_file = (
+    f"{ticker}_{target_date}_"
+    f"{start_time.replace(':','')}_"
+    f"{end_time.replace(':','')}_close_only.csv"
+)
+
+final_df.to_csv(output_file, index=False)
+
+print("\nSaved:", output_file)
+print("Rows:", len(final_df))
+print(final_df.head())
