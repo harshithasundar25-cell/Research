@@ -1,0 +1,335 @@
+!pip install curl_cffi -q
+import time, io, requests
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from curl_cffi import requests as cffi_requests
+from collections import defaultdict
+from scipy import stats
+from urllib.parse import quote
+from google.colab import files
+
+# ════════════════════════════════════════════════════════════
+# CONFIG
+# ════════════════════════════════════════════════════════════
+AUTH_TOKEN     = "9faf63f5-c9b6-4386-b2c0-856d6a96877a"
+EDT            = ZoneInfo("America/New_York")
+TARGET_TICKERS = 30
+
+WINDOW_RANGE = {
+    "nano":  (5,  30),
+    "micro": (5,  60),
+    "small": (5,  120),
+    "mid":   (5,  180),
+    "large": (5,  240),
+    "mega":  (5,  240),
+}
+RAW_CAP_FILTERS = {
+    "mega":  "cap_mega",  "large": "cap_large",
+    "mid":   "cap_mid",   "small": "cap_small",
+    "micro": "cap_micro", "nano":  "cap_nano",
+}
+CHANGE_FILTERS = {
+    "mega":  "ta_change_u1",  "large": "ta_change_u1",
+    "mid":   "ta_change_u5",  "small": "ta_change_u5",
+    "micro": "ta_change_u10", "nano":  "ta_change_u10",
+}
+RELVOL_OPTIONS = [
+    "sh_relvol_o0.75","sh_relvol_o1","sh_relvol_o1.5",
+    "sh_relvol_o2","sh_relvol_o3","sh_relvol_o5","sh_relvol_o10",
+]
+
+MARKET_CAP = input("Market cap (mega/large/mid/small/micro/nano): ").strip().lower()
+DATE_STR   = input("Date (YYYY-MM-DD): ").strip()
+START_TIME = "04:00"
+END_TIME   = "20:00"
+
+date_parts   = [int(x) for x in DATE_STR.split("-")]
+WINDOW_START = datetime(date_parts[0], date_parts[1], date_parts[2], 4,  0, 0, tzinfo=EDT)
+WINDOW_END   = datetime(date_parts[0], date_parts[1], date_parts[2], 20, 0, 0, tzinfo=EDT)
+WIN_MIN, WIN_MAX = WINDOW_RANGE[MARKET_CAP]
+
+print(f"\n✅ {MARKET_CAP.upper()} | {DATE_STR} | window search {WIN_MIN}–{WIN_MAX} mins\n")
+
+# ════════════════════════════════════════════════════════════
+# STEP 1 — GET TICKERS (progressive filter relaxation)
+# ════════════════════════════════════════════════════════════
+def fetch_tickers(market_cap):
+    best_tickers, best_diff = [], float("inf")
+
+    # Level 0: full filters
+    # Level 1: no change filter
+    # Level 2: no change + volume=50
+    # Level 3: just market cap
+    levels = [
+        lambda rv: f"{RAW_CAP_FILTERS[market_cap]},sh_curvol_o100,{rv},{CHANGE_FILTERS[market_cap]}",
+        lambda rv: f"{RAW_CAP_FILTERS[market_cap]},sh_curvol_o100,{rv}",
+        lambda rv: f"{RAW_CAP_FILTERS[market_cap]},sh_curvol_o50,{rv}",
+        lambda rv: f"{RAW_CAP_FILTERS[market_cap]}",
+    ]
+
+    for level_idx, build_filter in enumerate(levels):
+        relvol_list = RELVOL_OPTIONS if level_idx < 3 else ["sh_relvol_o0.75"]
+        for relvol in relvol_list:
+            filters = build_filter(relvol)
+            encoded = quote(filters, safe="")
+            url     = f"https://elite.finviz.com/export?v=111&f={encoded}&ft=3&auth={AUTH_TOKEN}"
+            try:
+                resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                if resp.status_code != 200:
+                    print(f"  HTTP {resp.status_code} — {resp.text[:80]}")
+                    continue
+                df = pd.read_csv(io.StringIO(resp.text))
+                if "Ticker" not in df.columns: continue
+                tickers = df["Ticker"].dropna().astype(str).tolist()
+                diff    = abs(len(tickers) - TARGET_TICKERS)
+                print(f"  level={level_idx} {relvol}: {len(tickers)} tickers")
+                if diff < best_diff:
+                    best_diff, best_tickers = diff, tickers
+                if level_idx == 3: break  # just market cap, no relvol loop needed
+            except Exception as e:
+                print(f"  error: {e}")
+            time.sleep(0.4)
+
+        if best_tickers:
+            print(f"  → Using {len(best_tickers)} tickers from level {level_idx}")
+            break
+
+    # If still nothing, return all tickers for that cap (up to 50)
+    if not best_tickers:
+        print("  Last resort: fetching all tickers for this cap...")
+        url = f"https://elite.finviz.com/export?v=111&f={RAW_CAP_FILTERS[market_cap]}&ft=3&auth={AUTH_TOKEN}"
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            df   = pd.read_csv(io.StringIO(resp.text))
+            if "Ticker" in df.columns:
+                best_tickers = df["Ticker"].dropna().astype(str).tolist()[:50]
+        except: pass
+
+    return best_tickers
+
+print(f"Scanning Finviz for {MARKET_CAP} tickers...")
+TICKERS = fetch_tickers(MARKET_CAP)
+print(f"\n✅ {len(TICKERS)} tickers found: {TICKERS[:10]}{'...' if len(TICKERS)>10 else ''}\n")
+if not TICKERS:
+    raise RuntimeError("No tickers found even after relaxing all filters.")
+
+# ════════════════════════════════════════════════════════════
+# STEP 2 — HELPERS
+# ════════════════════════════════════════════════════════════
+def parse_ts(ts_str):
+    return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+def extract_sentiment(msg):
+    raw = msg.get("entities", {}).get("sentiment", None)
+    return raw.get("basic", "None") if raw else "None"
+
+def safe_r(a, b):
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    if len(a) < 5 or a.std() == 0 or b.std() == 0: return 0.0
+    r, _ = stats.pearsonr(a, b)
+    return round(float(r), 4)
+
+def smooth(arr, k=5):
+    arr = list(arr)
+    if len(arr) < k: return arr
+    return np.convolve(arr, np.ones(k)/k, mode='same').tolist()
+
+def fetch_price(ticker):
+    url = f"https://elite.finviz.com/quote_export?t={ticker}&p=i1&auth={AUTH_TOKEN}"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if resp.status_code != 200: return None
+        df = pd.read_csv(io.StringIO(resp.text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        dt_col = next((c for c in df.columns if "date" in c or "time" in c), None)
+        if dt_col is None: return None
+
+        # Try both 12h and 24h formats
+        df["date"] = pd.to_datetime(df[dt_col].astype(str),
+                                    format="%m/%d/%Y %I:%M %p", errors="coerce")
+        if df["date"].isna().all():
+            df["date"] = pd.to_datetime(df[dt_col].astype(str),
+                                        format="%m/%d/%Y %H:%M", errors="coerce")
+        df = df.dropna(subset=["date"])
+        if len(df) == 0: return None
+
+        # Filter to target date client-side
+        start_dt = pd.Timestamp(f"{DATE_STR} {START_TIME}:00")
+        end_dt   = pd.Timestamp(f"{DATE_STR} {END_TIME}:00")
+        df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)].copy()
+        df = df[["date","close"]].sort_values("date").reset_index(drop=True)
+        return df if len(df) >= 5 else None
+    except:
+        return None
+
+def fetch_messages(ticker):
+    api_url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
+    headers = {"Accept": "application/json",
+               "Referer": f"https://stocktwits.com/symbol/{ticker}",
+               "Origin": "https://stocktwits.com"}
+    session, collected, max_id, stop, page = cffi_requests.Session(), [], None, False, 0
+    while not stop and page < 50:
+        page += 1
+        try:
+            params = {"limit": 30}
+            if max_id: params["max"] = max_id
+            data     = session.get(api_url, headers=headers, params=params,
+                                   timeout=20, impersonate="chrome136").json()
+            messages = data.get("messages", [])
+            if not messages: break
+            last_dt  = parse_ts(messages[-1]["created_at"]).astimezone(EDT)
+            if last_dt > WINDOW_END:
+                max_id = messages[-1]["id"]; time.sleep(0.3); continue
+            for msg in messages:
+                msg_edt = parse_ts(msg["created_at"]).astimezone(EDT)
+                if msg_edt > WINDOW_END: continue
+                if WINDOW_START <= msg_edt <= WINDOW_END:
+                    collected.append({
+                        "_ts": msg_edt.replace(tzinfo=None).replace(second=0, microsecond=0),
+                        "sentiment": extract_sentiment(msg),
+                    })
+                elif msg_edt < WINDOW_START:
+                    stop = True; break
+            max_id = messages[-1]["id"]
+            time.sleep(0.5)
+        except: break
+    return collected
+
+def build_windows(collected, window_mins):
+    mc, mb, mr = defaultdict(int), defaultdict(int), defaultdict(int)
+    for m in collected:
+        t = m["_ts"]
+        mc[t] += 1
+        if m["sentiment"] == "Bullish": mb[t] += 1
+        if m["sentiment"] == "Bearish": mr[t] += 1
+
+    windows, t = [], WINDOW_START.replace(tzinfo=None)
+    t_end = WINDOW_END.replace(tzinfo=None)
+    while t + timedelta(minutes=window_mins) <= t_end:
+        wend   = t + timedelta(minutes=window_mins)
+        keys   = [k for k in mc if t <= k < wend]
+        total  = sum(mc[k] for k in keys)
+        bull   = sum(mb[k] for k in keys)
+        bear   = sum(mr[k] for k in keys)
+        tagged = bull + bear
+        raw    = (bull - bear) / tagged if tagged > 0 else 0.0
+        windows.append({"t": t, "total": total,
+                        "weighted": raw * np.log1p(total)})
+        t += timedelta(minutes=1)
+
+    if not windows: return None
+    max_w = max(abs(w["weighted"]) for w in windows) or 1.0
+    for w in windows: w["norm_score"] = w["weighted"] / max_w
+
+    return pd.DataFrame({
+        "minute":     pd.to_datetime([w["t"] for w in windows]),
+        "density":    [w["total"] for w in windows],
+        "norm_score": [w["norm_score"] for w in windows],
+    })
+
+def merge_price_windows(df_price, win_df):
+    df_p = df_price.copy()
+    df_p["minute"] = df_p["date"].dt.floor("min")
+    df = pd.merge(df_p[["date","minute","close"]], win_df, on="minute", how="inner")
+    return df.dropna(subset=["close"]).reset_index(drop=True)
+
+def avg_corr(df_price, collected, window_mins):
+    win_df = build_windows(collected, window_mins)
+    if win_df is None: return 0.0
+    df = merge_price_windows(df_price, win_df)
+    if len(df) < 5 or df["density"].max() == 0: return 0.0
+    r_pd = safe_r(smooth(df["density"].values, k=5), smooth(df["close"].values, k=5))
+    r_ps = safe_r(smooth(df["norm_score"].values, k=5), smooth(df["close"].values, k=5))
+    return (r_pd + r_ps) / 2
+
+def compute_threshold(r_series, msg_counts, lookback=10):
+    if not r_series: return 0.3
+    recent_r    = r_series[-lookback:]
+    recent_msgs = msg_counts[-lookback:]
+    consistency = sum(1 for r in recent_r if r > 0) / len(recent_r)
+    avg_msgs    = np.mean(recent_msgs) if recent_msgs else 0
+    vol_bonus   = 0.1 * min(np.log1p(avg_msgs) / np.log1p(50), 1.0)
+    return round(0.3 + 0.1 * consistency + vol_bonus, 4)
+
+def get_threshold(df_price, collected, window_mins):
+    win_df = build_windows(collected, window_mins)
+    if win_df is None: return 0.3, 0.3
+    df = merge_price_windows(df_price, win_df)
+    if len(df) < 10: return 0.3, 0.3
+    df["ps"] = smooth(df["norm_score"].values, k=5)
+    df["dn"] = smooth(df["density"].values,    k=5)
+    df["pr"] = smooth(df["close"].values,      k=5)
+    WIN = 10
+    r_pd_h, r_ps_h, msg_h = [], [], []
+    for i in range(len(df)):
+        if i < WIN:
+            r_pd_h.append(0.0); r_ps_h.append(0.0)
+        else:
+            sl = df.iloc[i-WIN:i]
+            r_pd_h.append(safe_r(sl["dn"], sl["pr"]))
+            r_ps_h.append(safe_r(sl["ps"], sl["pr"]))
+        msg_h.append(df["density"].iloc[i])
+    return compute_threshold(r_pd_h, msg_h), compute_threshold(r_ps_h, msg_h)
+
+# ════════════════════════════════════════════════════════════
+# STEP 3 — PROCESS EACH TICKER
+# ════════════════════════════════════════════════════════════
+ticker_results = []
+
+for ticker in TICKERS:
+    print(f"  {ticker}...", end=" ")
+
+    df_price = fetch_price(ticker)
+    if df_price is None:
+        print("no price"); continue
+
+    msgs = fetch_messages(ticker)
+    if len(msgs) == 0:
+        print("no messages"); continue
+
+    # Find optimal window
+    best_w, best_r = WIN_MIN, -999.0
+    for w in range(WIN_MIN, WIN_MAX + 1, 5):
+        r = avg_corr(df_price.copy(), msgs, w)
+        if r > best_r:
+            best_r, best_w = r, w
+
+    # Get threshold at optimal window
+    t_pd, t_ps = get_threshold(df_price.copy(), msgs, best_w)
+    avg_t = round((t_pd + t_ps) / 2, 4)
+
+    print(f"window={best_w}m avg_r={best_r:.3f} thresh={avg_t}")
+    ticker_results.append({
+        "ticker": ticker, "optimal_window": best_w,
+        "best_avg_r": round(best_r, 4),
+        "thresh_pd": t_pd, "thresh_ps": t_ps, "avg_threshold": avg_t,
+    })
+
+# ════════════════════════════════════════════════════════════
+# STEP 4 — OUTPUT
+# ════════════════════════════════════════════════════════════
+if not ticker_results:
+    print("\n⚠️  No results — all tickers had no price data or no messages for this date.")
+    print("    This usually means the market was closed or data isn't available yet.")
+    print(f"    Try: {DATE_STR} is a {datetime(*date_parts).strftime('%A')} — check it's a trading day.")
+else:
+    df_r = pd.DataFrame(ticker_results)
+    opt_window = int(round(df_r["optimal_window"].mean() / 5) * 5)
+    opt_thresh = round(df_r["avg_threshold"].mean(), 4)
+
+    print(f"\n{'='*50}")
+    print(f"  MARKET CAP : {MARKET_CAP.upper()}")
+    print(f"  DATE       : {DATE_STR}")
+    print(f"{'='*50}")
+    print(f"\n  ✅ OPTIMAL ROLLING WINDOW : {opt_window} minutes")
+    print(f"  ✅ OPTIMAL THRESHOLD      : {opt_thresh}")
+    print(f"\n{'='*50}")
+    print(f"\nBreakdown ({len(df_r)} tickers):")
+    print(df_r[["ticker","optimal_window","best_avg_r","avg_threshold"]].to_string(index=False))
+
+    out = f"{MARKET_CAP}_{DATE_STR}_threshold_window.csv"
+    df_r.to_csv(out, index=False)
+    files.download(out)
+    print(f"\nCSV saved → {out}")
