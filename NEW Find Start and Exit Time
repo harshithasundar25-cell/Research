@@ -1,0 +1,459 @@
+!pip install curl_cffi -q
+import time, io, requests
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from curl_cffi import requests as cffi_requests
+from collections import defaultdict
+from scipy import stats
+from urllib.parse import quote
+from google.colab import files
+
+# ════════════════════════════════════════════════════════════
+# CONFIG — update token here only
+# ════════════════════════════════════════════════════════════
+AUTH_TOKEN = "f48427d7-3921-4503-995f-b68438d82745"
+
+RAW_CAP_FILTERS = {
+    "mega":  "cap_mega",  "large": "cap_large",
+    "mid":   "cap_mid",   "small": "cap_small",
+    "micro": "cap_micro", "nano":  "cap_nano",
+}
+CHANGE_FILTERS = {
+    "mega":  "ta_change_u1",  "large": "ta_change_u1",
+    "mid":   "ta_change_u5",  "small": "ta_change_u5",
+    "micro": "ta_change_u10", "nano":  "ta_change_u10",
+}
+RELVOL_OPTIONS = [
+    "sh_relvol_o0.75","sh_relvol_o1","sh_relvol_o1.5",
+    "sh_relvol_o2","sh_relvol_o3","sh_relvol_o5","sh_relvol_o10",
+]
+TARGET_TICKERS = 30
+EDT            = ZoneInfo("America/New_York")
+
+# ════════════════════════════════════════════════════════════
+# USER INPUT
+# ════════════════════════════════════════════════════════════
+MARKET_CAP = input("Market cap (mega/large/mid/small/micro/nano): ").strip().lower()
+DATE_STR   = input("Date (YYYY-MM-DD): ").strip()
+START_TIME = input("Start time (HH:MM, 24h): ").strip()
+END_TIME   = input("End time   (HH:MM, 24h): ").strip()
+ROLL_WIN   = int(input("Rolling window (minutes): ").strip())
+THRESHOLD  = float(input("Correlation threshold (e.g. 0.35): ").strip())
+
+date_parts   = [int(x) for x in DATE_STR.split("-")]
+WINDOW_START = datetime(date_parts[0], date_parts[1], date_parts[2],
+                        int(START_TIME.split(":")[0]), int(START_TIME.split(":")[1]), 0, tzinfo=EDT)
+WINDOW_END   = datetime(date_parts[0], date_parts[1], date_parts[2],
+                        int(END_TIME.split(":")[0]),   int(END_TIME.split(":")[1]),   0, tzinfo=EDT)
+
+print(f"\n✅ {MARKET_CAP.upper()} | {DATE_STR} | {START_TIME}–{END_TIME} | window={ROLL_WIN}min | threshold={THRESHOLD}\n")
+
+# ════════════════════════════════════════════════════════════
+# STEP 1 — GET TICKERS FROM FINVIZ
+# ════════════════════════════════════════════════════════════
+def fetch_tickers(market_cap, auth):
+    best_tickers, best_diff = [], float("inf")
+
+    # Progressive relaxation — try strict filters first, loosen if nothing found
+    def try_url(filters_str):
+        nonlocal best_tickers, best_diff
+        encoded = quote(filters_str, safe="")
+        url     = f"https://elite.finviz.com/export?v=111&f={encoded}&ft=3&auth={auth}"
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if resp.status_code == 401:
+                print("  ❌ Token expired — get a new one from Finviz Elite")
+                return False
+            if resp.status_code != 200:
+                return True
+            df = pd.read_csv(io.StringIO(resp.text))
+            if "Ticker" not in df.columns: return True
+            tickers = df["Ticker"].dropna().astype(str).tolist()
+            diff    = abs(len(tickers) - TARGET_TICKERS)
+            print(f"  [{filters_str[:40]}...] → {len(tickers)} tickers")
+            if diff < best_diff:
+                best_diff, best_tickers = diff, tickers
+        except Exception as e:
+            print(f"  error: {e}")
+        return True
+
+    cap  = RAW_CAP_FILTERS[market_cap]
+    chg  = CHANGE_FILTERS[market_cap]
+    vol1 = "sh_curvol_o100"
+    vol2 = "sh_curvol_o50"
+
+    # Level 0: full filters with each relvol
+    print("  Trying full filters...")
+    for rv in RELVOL_OPTIONS:
+        ok = try_url(f"{cap},{vol1},{rv},{chg}")
+        if not ok: return []
+        time.sleep(0.3)
+    if best_tickers: return best_tickers
+
+    # Level 1: no change filter
+    print("  Relaxing — removing change filter...")
+    for rv in RELVOL_OPTIONS:
+        try_url(f"{cap},{vol1},{rv}")
+        time.sleep(0.3)
+    if best_tickers: return best_tickers
+
+    # Level 2: lower volume threshold
+    print("  Relaxing — lowering volume threshold...")
+    for rv in RELVOL_OPTIONS:
+        try_url(f"{cap},{vol2},{rv}")
+        time.sleep(0.3)
+    if best_tickers: return best_tickers
+
+    # Level 3: just market cap
+    print("  Relaxing — just market cap filter...")
+    try_url(cap)
+    if best_tickers: return best_tickers
+
+    # Level 4: absolute last resort — all tickers for cap, take first 30
+    print("  Last resort — fetching all tickers for this cap...")
+    url = f"https://elite.finviz.com/export?v=111&f={cap}&ft=3&auth={auth}"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if resp.status_code == 200:
+            df = pd.read_csv(io.StringIO(resp.text))
+            if "Ticker" in df.columns:
+                best_tickers = df["Ticker"].dropna().astype(str).tolist()[:TARGET_TICKERS]
+                print(f"  Got {len(best_tickers)} tickers")
+    except Exception as e:
+        print(f"  Last resort error: {e}")
+
+    return best_tickers
+
+print(f"Scanning Finviz for {MARKET_CAP} tickers...")
+TICKERS = fetch_tickers(MARKET_CAP, AUTH_TOKEN)
+print(f"\n✅ {len(TICKERS)} tickers: {TICKERS[:10]}{'...' if len(TICKERS) > 10 else ''}\n")
+
+if not TICKERS:
+    raise RuntimeError(
+        "No tickers found. Either the token expired or no tickers match. "
+        "Get a fresh token from https://elite.finviz.com"
+    )
+
+# ════════════════════════════════════════════════════════════
+# STEP 2 — HELPERS
+# ════════════════════════════════════════════════════════════
+def parse_ts(ts_str):
+    return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+def extract_sentiment(msg):
+    raw = msg.get("entities", {}).get("sentiment", None)
+    return raw.get("basic", "None") if raw else "None"
+
+def smooth(arr, k=5):
+    arr = list(arr)
+    if len(arr) < k: return arr
+    return np.convolve(arr, np.ones(k)/k, mode='same').tolist()
+
+def safe_r(a, b):
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    if len(a) < 5 or a.std() == 0 or b.std() == 0: return 0.0
+    r, _ = stats.pearsonr(a, b)
+    return round(float(r), 4)
+
+# ── Fetch price from Finviz ───────────────────────────────
+def fetch_price(ticker):
+    url = f"https://elite.finviz.com/quote_export?t={ticker}&p=i1&auth={AUTH_TOKEN}"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if resp.status_code != 200: return None
+        df = pd.read_csv(io.StringIO(resp.text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        dt_col = next((c for c in df.columns if "date" in c or "time" in c), None)
+        if dt_col is None: return None
+
+        # Try 12-hour AM/PM format first, then 24-hour
+        df["date"] = pd.to_datetime(
+            df[dt_col].astype(str), format="%m/%d/%Y %I:%M %p", errors="coerce"
+        )
+        if df["date"].isna().all():
+            df["date"] = pd.to_datetime(
+                df[dt_col].astype(str).str.replace(r"\s+(AM|PM)$", "", regex=True),
+                format="%m/%d/%Y %H:%M", errors="coerce"
+            )
+        df = df.dropna(subset=["date"])
+        if len(df) == 0: return None
+
+        # Filter to target date + time range client-side
+        start_dt = pd.Timestamp(f"{DATE_STR} {START_TIME}:00")
+        end_dt   = pd.Timestamp(f"{DATE_STR} {END_TIME}:00")
+        df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)].copy()
+        df = df[["date","close"]].sort_values("date").reset_index(drop=True)
+        return df if len(df) >= 5 else None
+    except:
+        return None
+
+# ── Fetch StockTwits messages ─────────────────────────────
+def fetch_messages(ticker):
+    api_url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
+    headers = {
+        "Accept":  "application/json",
+        "Referer": f"https://stocktwits.com/symbol/{ticker}",
+        "Origin":  "https://stocktwits.com",
+    }
+    session, collected, max_id, stop, page = cffi_requests.Session(), [], None, False, 0
+    while not stop and page < 50:
+        page += 1
+        try:
+            params = {"limit": 30}
+            if max_id: params["max"] = max_id
+            data     = session.get(api_url, headers=headers, params=params,
+                                   timeout=20, impersonate="chrome136").json()
+            messages = data.get("messages", [])
+            if not messages: break
+            last_dt  = parse_ts(messages[-1]["created_at"]).astimezone(EDT)
+            if last_dt > WINDOW_END:
+                max_id = messages[-1]["id"]; time.sleep(0.3); continue
+            for msg in messages:
+                msg_edt = parse_ts(msg["created_at"]).astimezone(EDT)
+                if msg_edt > WINDOW_END: continue
+                if WINDOW_START <= msg_edt <= WINDOW_END:
+                    collected.append({
+                        "_ts":       msg_edt.replace(tzinfo=None).replace(second=0, microsecond=0),
+                        "sentiment": extract_sentiment(msg),
+                    })
+                elif msg_edt < WINDOW_START:
+                    stop = True; break
+            max_id = messages[-1]["id"]
+            time.sleep(0.8)
+        except: break
+    return collected
+
+# ── Build rolling windows ─────────────────────────────────
+def build_rolling_windows(collected, window_mins):
+    mc, mb, mr = defaultdict(int), defaultdict(int), defaultdict(int)
+    for m in collected:
+        t = m["_ts"]
+        mc[t] += 1
+        if m["sentiment"] == "Bullish": mb[t] += 1
+        if m["sentiment"] == "Bearish": mr[t] += 1
+
+    windows, t = [], WINDOW_START.replace(tzinfo=None)
+    t_end = WINDOW_END.replace(tzinfo=None)
+    while t + timedelta(minutes=window_mins) <= t_end:
+        wend   = t + timedelta(minutes=window_mins)
+        keys   = [k for k in mc if t <= k < wend]
+        total  = sum(mc[k] for k in keys)
+        bull   = sum(mb[k] for k in keys)
+        bear   = sum(mr[k] for k in keys)
+        tagged = bull + bear
+        raw    = (bull - bear) / tagged if tagged > 0 else 0.0
+        windows.append({"t": t, "total": total,
+                        "weighted": raw * np.log1p(total)})
+        t += timedelta(minutes=1)
+
+    if not windows: return None
+    max_w = max(abs(w["weighted"]) for w in windows) or 1.0
+    for w in windows:
+        w["norm_score"] = w["weighted"] / max_w
+
+    return pd.DataFrame({
+        "minute":     pd.to_datetime([w["t"]          for w in windows]),
+        "density":    [w["total"]      for w in windows],
+        "norm_score": [w["norm_score"] for w in windows],
+    })
+
+# ── Find entry/exit signals ───────────────────────────────
+def find_signals(df, threshold, roll_win):
+    if len(df) < roll_win + 2: return []
+
+    df = df.copy().reset_index(drop=True)
+    df["price_smooth"]   = smooth(df["close"].values,      k=5)
+    df["density_smooth"] = smooth(df["density"].values,    k=5)
+    df["score_smooth"]   = smooth(df["norm_score"].values, k=5)
+
+    r_pd_series, r_ps_series = [], []
+    for i in range(len(df)):
+        if i < roll_win:
+            r_pd_series.append(0.0)
+            r_ps_series.append(0.0)
+        else:
+            sl = df.iloc[i-roll_win:i]
+            r_pd_series.append(safe_r(sl["density_smooth"], sl["price_smooth"]))
+            r_ps_series.append(safe_r(sl["score_smooth"],   sl["price_smooth"]))
+
+    df["r_pd"] = r_pd_series
+    df["r_ps"] = r_ps_series
+    df["price_rising"] = (
+        df["price_smooth"] > df["price_smooth"].shift(5).fillna(df["price_smooth"])
+    )
+
+    # Entry: price rising + BOTH correlations >= threshold
+    df["entry_signal"] = (
+        df["price_rising"] &
+        (df["r_pd"] >= threshold) &
+        (df["r_ps"] >= threshold)
+    )
+    # Exit: EITHER correlation drops below threshold
+    df["exit_signal"] = (
+        (df["r_pd"] < threshold) |
+        (df["r_ps"] < threshold)
+    )
+
+    signals, in_trade, entry_row = [], False, None
+
+    for i, row in df.iterrows():
+        if not in_trade and row["entry_signal"]:
+            in_trade, entry_row = True, row
+        elif in_trade and row["exit_signal"]:
+            pct = round((row["close"] - entry_row["close"]) / entry_row["close"] * 100, 4)
+            signals.append({
+                "entry_time":     entry_row["date"].strftime("%H:%M"),
+                "exit_time":      row["date"].strftime("%H:%M"),
+                "entry_price":    round(float(entry_row["close"]), 4),
+                "exit_price":     round(float(row["close"]), 4),
+                "pct_change":     pct,
+                "outcome":        "GAIN" if pct >= 0 else "LOSS",
+                "entry_r_pd":     round(float(entry_row["r_pd"]), 4),
+                "entry_r_ps":     round(float(entry_row["r_ps"]), 4),
+                "exit_r_pd":      round(float(row["r_pd"]), 4),
+                "exit_r_ps":      round(float(row["r_ps"]), 4),
+                "exit_reason":    (
+                    "r_pd below threshold" if row["r_pd"] < threshold and row["r_ps"] >= threshold
+                    else "r_ps below threshold" if row["r_ps"] < threshold and row["r_pd"] >= threshold
+                    else "both below threshold"
+                ),
+                "threshold_used": threshold,
+                "rolling_window": roll_win,
+            })
+            in_trade, entry_row = False, None
+
+    # EOD — still in trade
+    if in_trade and entry_row is not None:
+        last = df.iloc[-1]
+        pct  = round((last["close"] - entry_row["close"]) / entry_row["close"] * 100, 4)
+        signals.append({
+            "entry_time":     entry_row["date"].strftime("%H:%M"),
+            "exit_time":      last["date"].strftime("%H:%M") + " (EOD)",
+            "entry_price":    round(float(entry_row["close"]), 4),
+            "exit_price":     round(float(last["close"]), 4),
+            "pct_change":     pct,
+            "outcome":        "GAIN (EOD)" if pct >= 0 else "LOSS (EOD)",
+            "entry_r_pd":     round(float(entry_row["r_pd"]), 4),
+            "entry_r_ps":     round(float(entry_row["r_ps"]), 4),
+            "exit_r_pd":      round(float(last["r_pd"]), 4),
+            "exit_r_ps":      round(float(last["r_ps"]), 4),
+            "exit_reason":    "EOD — no exit signal triggered",
+            "threshold_used": threshold,
+            "rolling_window": roll_win,
+        })
+
+    return signals
+
+# ════════════════════════════════════════════════════════════
+# STEP 3 — PROCESS EACH TICKER
+# ════════════════════════════════════════════════════════════
+all_results = []
+
+for ticker in TICKERS:
+    print(f"  {ticker}...", end=" ", flush=True)
+
+    df_price = fetch_price(ticker)
+    if df_price is None:
+        print("no price data"); continue
+
+    msgs = fetch_messages(ticker)
+    if len(msgs) == 0:
+        print("no messages"); continue
+
+    win_df = build_rolling_windows(msgs, ROLL_WIN)
+    if win_df is None:
+        print("no windows"); continue
+
+    df_price["minute"] = df_price["date"].dt.floor("min")
+    df = pd.merge(df_price[["date","minute","close"]], win_df, on="minute", how="inner")
+    df = df.dropna(subset=["close"]).reset_index(drop=True)
+
+    if len(df) < ROLL_WIN + 2 or df["density"].max() == 0:
+        print("insufficient overlap"); continue
+
+    r_pd = safe_r(smooth(df["density"].values,    k=5), smooth(df["close"].values, k=5))
+    r_ps = safe_r(smooth(df["norm_score"].values, k=5), smooth(df["close"].values, k=5))
+    r_ds = safe_r(smooth(df["density"].values,    k=5), smooth(df["norm_score"].values, k=5))
+
+    signals = find_signals(df, THRESHOLD, ROLL_WIN)
+    print(f"{len(msgs)} msgs | r_pd={r_pd:+.3f} r_ps={r_ps:+.3f} | {len(signals)} trade(s)")
+
+    if not signals:
+        all_results.append({
+            "ticker": ticker, "market_cap": MARKET_CAP, "date": DATE_STR,
+            "rolling_window": ROLL_WIN, "threshold_used": THRESHOLD,
+            "entry_time": "NO SIGNAL", "exit_time": "NO SIGNAL",
+            "entry_price": "", "exit_price": "", "pct_change": "",
+            "outcome": "NO SIGNAL", "entry_r_pd": "", "entry_r_ps": "",
+            "exit_r_pd": "", "exit_r_ps": "",
+            "exit_reason": "Correlations never met threshold",
+            "overall_r_pd": r_pd, "overall_r_ps": r_ps, "overall_r_ds": r_ds,
+            "total_messages": len(msgs),
+        })
+    else:
+        for sig in signals:
+            all_results.append({
+                "ticker": ticker, "market_cap": MARKET_CAP, "date": DATE_STR,
+                "rolling_window": sig["rolling_window"],
+                "threshold_used": sig["threshold_used"],
+                "entry_time":     sig["entry_time"],
+                "exit_time":      sig["exit_time"],
+                "entry_price":    sig["entry_price"],
+                "exit_price":     sig["exit_price"],
+                "pct_change":     sig["pct_change"],
+                "outcome":        sig["outcome"],
+                "entry_r_pd":     sig["entry_r_pd"],
+                "entry_r_ps":     sig["entry_r_ps"],
+                "exit_r_pd":      sig["exit_r_pd"],
+                "exit_r_ps":      sig["exit_r_ps"],
+                "exit_reason":    sig["exit_reason"],
+                "overall_r_pd":   r_pd,
+                "overall_r_ps":   r_ps,
+                "overall_r_ds":   r_ds,
+                "total_messages": len(msgs),
+            })
+
+# ════════════════════════════════════════════════════════════
+# STEP 4 — SAVE CSV
+# ════════════════════════════════════════════════════════════
+if not all_results:
+    print("\n⚠️ No data — check the date is a trading day and the token is valid.")
+else:
+    results_df = pd.DataFrame(all_results)
+
+    has_signal = results_df["outcome"] != "NO SIGNAL"
+    df_trades  = results_df[has_signal].copy()
+    df_nosig   = results_df[~has_signal].copy()
+
+    df_trades["pct_change"] = pd.to_numeric(df_trades["pct_change"], errors="coerce")
+    df_trades  = df_trades.sort_values("pct_change", ascending=False)
+    results_df = pd.concat([df_trades, df_nosig]).reset_index(drop=True)
+
+    trades = df_trades.copy()
+    n_gain = trades["outcome"].str.contains("GAIN").sum()
+    n_loss = trades["outcome"].str.contains("LOSS").sum()
+
+    print(f"\n{'='*60}")
+    print(f"  {MARKET_CAP.upper()} | {DATE_STR} | window={ROLL_WIN}min | threshold={THRESHOLD}")
+    print(f"  Total tickers processed : {results_df['ticker'].nunique()}")
+    print(f"  Tickers with signals    : {trades['ticker'].nunique()}")
+    print(f"  Total trades            : {len(trades)}")
+    print(f"  Gains                   : {n_gain}")
+    print(f"  Losses                  : {n_loss}")
+    if len(trades) > 0 and trades["pct_change"].notna().any():
+        print(f"  Avg pct change          : {trades['pct_change'].mean():+.2f}%")
+    print(f"{'='*60}")
+
+    if len(trades) > 0:
+        print(f"\nAll trades:")
+        print(trades[["ticker","entry_time","exit_time","entry_price",
+                       "exit_price","pct_change","outcome",
+                       "entry_r_pd","entry_r_ps","exit_reason"]].to_string(index=False))
+
+    out = (f"{MARKET_CAP}_{DATE_STR}_"
+           f"w{ROLL_WIN}_t{str(THRESHOLD).replace('.','p')}_signals.csv")
+    results_df.to_csv(out, index=False)
+    files.download(out)
+    print(f"\n✅ Saved → {out}")
