@@ -1,5 +1,3 @@
-!pip install curl_cffi -q
-
 import time, io, requests
 import numpy as np
 import pandas as pd
@@ -9,12 +7,16 @@ from curl_cffi import requests as cffi_requests
 from collections import defaultdict
 from scipy import stats
 from urllib.parse import quote
-from google.colab import files
+import json, os, re
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 
 # ════════════════════════════════════════════════════════════
 # CONFIG
 # ════════════════════════════════════════════════════════════
-AUTH_TOKEN = "f48427d7-3921-4503-995f-b68438d82745"
+TOKEN_FILE = "finviz_token.json"
 
 RAW_CAP_FILTERS = {
     "mega":  "cap_mega",  "large": "cap_large",
@@ -34,8 +36,75 @@ TARGET_TICKERS = 30
 EDT            = ZoneInfo("America/New_York")
 
 # ════════════════════════════════════════════════════════════
+# TOKEN MANAGEMENT
+# ════════════════════════════════════════════════════════════
+def get_token_via_browser():
+    print("\nOpening Finviz Elite to fetch API token...")
+    print("If a login page appears, please log in.\n")
+    driver = webdriver.Chrome(options=Options())
+    try:
+        driver.get("https://elite.finviz.com/api_explanation")
+        WebDriverWait(driver, 60).until(
+            lambda d: "elite.finviz.com" in d.current_url
+        )
+        time.sleep(3)
+
+        # Search page source for UUID token
+        token_match = re.search(
+            r'auth=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+            driver.page_source
+        )
+        if not token_match:
+            for link in driver.find_elements(By.TAG_NAME, "a"):
+                href = link.get_attribute("href") or ""
+                m = re.search(
+                    r'auth=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+                    href
+                )
+                if m:
+                    token_match = m
+                    break
+        driver.quit()
+
+        if token_match:
+            token = token_match.group(1)
+            print(f"✅ Token found: {token}")
+            with open(TOKEN_FILE, "w") as f:
+                json.dump({"token": token, "fetched_at": datetime.now().isoformat()}, f)
+            return token
+        else:
+            print("⚠️  Could not find token automatically.")
+            return input("Paste token from https://elite.finviz.com/api_explanation: ").strip()
+    except Exception as e:
+        driver.quit()
+        print(f"Browser error: {e}")
+        return input("Paste token manually: ").strip()
+
+def get_auth_token():
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE) as f:
+            data = json.load(f)
+        token   = data.get("token", "")
+        fetched = datetime.fromisoformat(data.get("fetched_at", "2000-01-01"))
+        age_hrs = (datetime.now() - fetched).total_seconds() / 3600
+        if age_hrs < 23:
+            test = requests.get(
+                f"https://elite.finviz.com/export?v=111&f=cap_nano&ft=3&auth={token}",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+            )
+            if test.status_code == 200:
+                print(f"✅ Using cached token (age: {age_hrs:.1f}h)")
+                return token
+            print("  Cached token invalid, fetching new one...")
+    return get_token_via_browser()
+
+# ════════════════════════════════════════════════════════════
 # USER INPUT
 # ════════════════════════════════════════════════════════════
+print("=" * 65)
+print("  FINVIZ + STOCKTWITS SIGNAL SCANNER")
+print("=" * 65)
+
 MARKET_CAP     = input("Market cap (mega/large/mid/small/micro/nano): ").strip().lower()
 DATE_STR       = input("Date (YYYY-MM-DD): ").strip()
 START_TIME     = input("Start time (HH:MM, 24h): ").strip()
@@ -50,12 +119,13 @@ WINDOW_START = datetime(date_parts[0], date_parts[1], date_parts[2],
                         int(START_TIME.split(":")[0]), int(START_TIME.split(":")[1]), 0, tzinfo=EDT)
 WINDOW_END   = datetime(date_parts[0], date_parts[1], date_parts[2],
                         int(END_TIME.split(":")[0]),   int(END_TIME.split(":")[1]),   0, tzinfo=EDT)
-
-R_LOOKBACK = max(ROLL_WIN, 30)
+R_LOOKBACK   = max(ROLL_WIN, 30)
 
 print(f"\n✅ {MARKET_CAP.upper()} | {DATE_STR} | {START_TIME}–{END_TIME}")
 print(f"   rolling_window={ROLL_WIN} | r_lookback={R_LOOKBACK} | corr_threshold={THRESHOLD}")
 print(f"   sent_threshold={SENT_THRESHOLD} | msg_threshold={MSG_THRESHOLD}\n")
+
+AUTH_TOKEN = get_auth_token()
 
 # ════════════════════════════════════════════════════════════
 # STEP 1 — GET TICKERS
@@ -76,7 +146,7 @@ def fetch_tickers(market_cap, auth):
             if "Ticker" not in df.columns: return True
             tickers = df["Ticker"].dropna().astype(str).tolist()
             diff    = abs(len(tickers) - TARGET_TICKERS)
-            print(f"  [{filters_str[:50]}] → {len(tickers)} tickers")
+            print(f"  [{filters_str[:55]}] → {len(tickers)} tickers")
             if diff < best_diff:
                 best_diff, best_tickers = diff, tickers
         except Exception as e:
@@ -116,8 +186,9 @@ def fetch_tickers(market_cap, auth):
             df = pd.read_csv(io.StringIO(resp.text))
             if "Ticker" in df.columns:
                 best_tickers = df["Ticker"].dropna().astype(str).tolist()[:TARGET_TICKERS]
-    except: pass
-
+                print(f"  Got {len(best_tickers)} tickers")
+    except Exception as e:
+        print(f"  error: {e}")
     return best_tickers
 
 print(f"Scanning Finviz for {MARKET_CAP} tickers...")
@@ -148,31 +219,50 @@ def safe_r(a, b):
     return round(float(r), 4)
 
 def fetch_price(ticker):
-    url = f"https://elite.finviz.com/quote_export?t={ticker}&p=i1&auth={AUTH_TOKEN}"
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if resp.status_code != 200: return None
-        df = pd.read_csv(io.StringIO(resp.text))
-        df.columns = [c.strip().lower() for c in df.columns]
-        dt_col = next((c for c in df.columns if "date" in c or "time" in c), None)
-        if dt_col is None: return None
-        df["date"] = pd.to_datetime(
-            df[dt_col].astype(str), format="%m/%d/%Y %I:%M %p", errors="coerce"
-        )
-        if df["date"].isna().all():
+    """
+    Fetch ALL available intraday data from Finviz (no date params —
+    they are ignored). Filter to target date + time client-side.
+    Uses p=i1 (1-min bars) and also tries p=i5 as fallback.
+    """
+    for interval in ["i1", "i5"]:
+        url = f"https://elite.finviz.com/quote_export?t={ticker}&p={interval}&auth={AUTH_TOKEN}"
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if resp.status_code != 200: continue
+            df = pd.read_csv(io.StringIO(resp.text))
+            df.columns = [c.strip().lower() for c in df.columns]
+            dt_col = next((c for c in df.columns if "date" in c or "time" in c), None)
+            if dt_col is None: continue
+
+            # Try 12-hour AM/PM first, then 24-hour
             df["date"] = pd.to_datetime(
-                df[dt_col].astype(str).str.replace(r"\s+(AM|PM)$","",regex=True),
-                format="%m/%d/%Y %H:%M", errors="coerce"
+                df[dt_col].astype(str), format="%m/%d/%Y %I:%M %p", errors="coerce"
             )
-        df = df.dropna(subset=["date"])
-        if len(df) == 0: return None
-        start_dt = pd.Timestamp(f"{DATE_STR} {START_TIME}:00")
-        end_dt   = pd.Timestamp(f"{DATE_STR} {END_TIME}:00")
-        df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)].copy()
-        df = df[["date","close"]].sort_values("date").reset_index(drop=True)
-        return df if len(df) >= 5 else None
-    except:
-        return None
+            if df["date"].isna().all():
+                df["date"] = pd.to_datetime(
+                    df[dt_col].astype(str).str.replace(r"\s+(AM|PM)$","",regex=True),
+                    format="%m/%d/%Y %H:%M", errors="coerce"
+                )
+            df = df.dropna(subset=["date"])
+            if len(df) == 0: continue
+
+            # Show what dates are available (helpful for debugging)
+            available = sorted(df["date"].dt.date.unique())
+            print(f"    [{ticker}] Finviz dates: {available}")
+
+            # Filter client-side to our target date and time
+            start_dt = pd.Timestamp(f"{DATE_STR} {START_TIME}:00")
+            end_dt   = pd.Timestamp(f"{DATE_STR} {END_TIME}:00")
+            df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)].copy()
+            df = df[["date","close"]].sort_values("date").reset_index(drop=True)
+
+            if len(df) >= 5:
+                print(f"    [{ticker}] {len(df)} rows | "
+                      f"{df['date'].min().strftime('%H:%M')} → {df['date'].max().strftime('%H:%M')}")
+                return df
+        except Exception as e:
+            print(f"    [{ticker}] fetch error: {e}")
+    return None
 
 def fetch_messages(ticker):
     api_url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
@@ -228,10 +318,10 @@ def build_rolling_windows(collected, window_mins):
         tagged = bull + bear
         raw    = (bull - bear) / tagged if tagged > 0 else 0.0
         windows.append({
-            "t":        t,
-            "total":    total,
+            "t":            t,
+            "total":        total,
             "msgs_per_min": total / window_mins,
-            "weighted": raw * np.log1p(total),
+            "weighted":     raw * np.log1p(total),
         })
         t += timedelta(minutes=1)
 
@@ -241,10 +331,10 @@ def build_rolling_windows(collected, window_mins):
         w["norm_score"] = w["weighted"] / max_w
 
     return pd.DataFrame({
-        "minute":       pd.to_datetime([w["t"]           for w in windows]),
-        "density":      [w["total"]       for w in windows],
+        "minute":       pd.to_datetime([w["t"]            for w in windows]),
+        "density":      [w["total"]        for w in windows],
         "msgs_per_min": [w["msgs_per_min"] for w in windows],
-        "norm_score":   [w["norm_score"]  for w in windows],
+        "norm_score":   [w["norm_score"]   for w in windows],
     })
 
 def compute_avg_sentiment_density(collected, window_mins):
@@ -272,7 +362,7 @@ def compute_avg_sentiment_density(collected, window_mins):
 
     max_w = max(abs(s) for s in scores) or 1.0
     norm  = [s / max_w for s in scores]
-    return (round(float(np.mean(norm)),     4) if norm      else 0.0,
+    return (round(float(np.mean(norm)),      4) if norm      else 0.0,
             round(float(np.mean(densities)), 4) if densities else 0.0)
 
 # ════════════════════════════════════════════════════════════
@@ -280,26 +370,12 @@ def compute_avg_sentiment_density(collected, window_mins):
 # ════════════════════════════════════════════════════════════
 def find_signals(df, threshold, roll_win, r_lookback,
                  sent_threshold, msg_threshold):
-    """
-    ENTRY (all must be true):
-      1. price rising
-      2. r(price/density)   >= threshold
-      3. r(price/sentiment) >= threshold
-      4. current norm_score >= sent_threshold
-      5. current msgs_per_min >= msg_threshold
-
-    EXIT (any one triggers):
-      - r(price/density)   < threshold
-      - r(price/sentiment) < threshold
-      - current msgs_per_min < msg_threshold   ← new
-      - current norm_score   < sent_threshold  ← new
-    """
     if len(df) < r_lookback + 2: return []
 
     df = df.copy().reset_index(drop=True)
-    df["price_smooth"]   = smooth(df["close"].values,       k=5)
-    df["density_smooth"] = smooth(df["density"].values,     k=5)
-    df["score_smooth"]   = smooth(df["norm_score"].values,  k=5)
+    df["price_smooth"]   = smooth(df["close"].values,        k=5)
+    df["density_smooth"] = smooth(df["density"].values,      k=5)
+    df["score_smooth"]   = smooth(df["norm_score"].values,   k=5)
     df["mpm_smooth"]     = smooth(df["msgs_per_min"].values, k=5)
 
     r_pd_series, r_ps_series = [], []
@@ -314,21 +390,20 @@ def find_signals(df, threshold, roll_win, r_lookback,
 
     df["r_pd"] = r_pd_series
     df["r_ps"] = r_ps_series
-
     df["price_rising"] = (
         df["price_smooth"] > df["price_smooth"].shift(5).fillna(df["price_smooth"])
     )
 
-    # ── Entry: all 5 conditions ───────────────────────────
+    # Entry: all 5 conditions
     df["entry_signal"] = (
         df["price_rising"] &
-        (df["r_pd"]        >= threshold) &
-        (df["r_ps"]        >= threshold) &
+        (df["r_pd"]         >= threshold) &
+        (df["r_ps"]         >= threshold) &
         (df["score_smooth"] >= sent_threshold) &
         (df["mpm_smooth"]   >= msg_threshold)
     )
 
-    # ── Exit: any condition breaks ────────────────────────
+    # Exit: any one condition breaks
     df["exit_signal"] = (
         (df["r_pd"]         < threshold) |
         (df["r_ps"]         < threshold) |
@@ -336,11 +411,10 @@ def find_signals(df, threshold, roll_win, r_lookback,
         (df["score_smooth"] < sent_threshold)
     )
 
-    # Determine exit reason string
     def exit_reason(row):
         reasons = []
-        if row["r_pd"]         < threshold:    reasons.append("r_pd below corr threshold")
-        if row["r_ps"]         < threshold:    reasons.append("r_ps below corr threshold")
+        if row["r_pd"]         < threshold:     reasons.append("r_pd below corr threshold")
+        if row["r_ps"]         < threshold:     reasons.append("r_ps below corr threshold")
         if row["mpm_smooth"]   < msg_threshold: reasons.append("msgs/min below threshold")
         if row["score_smooth"] < sent_threshold: reasons.append("sentiment below threshold")
         return " | ".join(reasons) if reasons else ""
@@ -350,26 +424,24 @@ def find_signals(df, threshold, roll_win, r_lookback,
     for i, row in df.iterrows():
         if not in_trade and row["entry_signal"]:
             in_trade, entry_row = True, row
-
         elif in_trade and row["exit_signal"]:
             pct = round((row["close"] - entry_row["close"]) / entry_row["close"] * 100, 4)
             signals.append({
-                "ticker":           "",   # filled in caller
-                "entry_time":       entry_row["date"].strftime("%H:%M"),
-                "exit_time":        row["date"].strftime("%H:%M"),
-                "entry_price":      round(float(entry_row["close"]), 4),
-                "exit_price":       round(float(row["close"]), 4),
-                "pct_change":       pct,
-                "outcome":          "GAIN" if pct >= 0 else "LOSS",
-                "entry_r_pd":       round(float(entry_row["r_pd"]), 4),
-                "entry_r_ps":       round(float(entry_row["r_ps"]), 4),
-                "entry_sentiment":  round(float(entry_row["score_smooth"]), 4),
-                "entry_msgs_min":   round(float(entry_row["mpm_smooth"]), 4),
-                "exit_r_pd":        round(float(row["r_pd"]), 4),
-                "exit_r_ps":        round(float(row["r_ps"]), 4),
-                "exit_sentiment":   round(float(row["score_smooth"]), 4),
-                "exit_msgs_min":    round(float(row["mpm_smooth"]), 4),
-                "exit_reason":      exit_reason(row),
+                "entry_time":      entry_row["date"].strftime("%H:%M"),
+                "exit_time":       row["date"].strftime("%H:%M"),
+                "entry_price":     round(float(entry_row["close"]), 4),
+                "exit_price":      round(float(row["close"]), 4),
+                "pct_change":      pct,
+                "outcome":         "GAIN" if pct >= 0 else "LOSS",
+                "entry_r_pd":      round(float(entry_row["r_pd"]), 4),
+                "entry_r_ps":      round(float(entry_row["r_ps"]), 4),
+                "entry_sentiment": round(float(entry_row["score_smooth"]), 4),
+                "entry_msgs_min":  round(float(entry_row["mpm_smooth"]), 4),
+                "exit_r_pd":       round(float(row["r_pd"]), 4),
+                "exit_r_ps":       round(float(row["r_ps"]), 4),
+                "exit_sentiment":  round(float(row["score_smooth"]), 4),
+                "exit_msgs_min":   round(float(row["mpm_smooth"]), 4),
+                "exit_reason":     exit_reason(row),
             })
             in_trade, entry_row = False, None
 
@@ -378,22 +450,21 @@ def find_signals(df, threshold, roll_win, r_lookback,
         last = df.iloc[-1]
         pct  = round((last["close"] - entry_row["close"]) / entry_row["close"] * 100, 4)
         signals.append({
-            "ticker":           "",
-            "entry_time":       entry_row["date"].strftime("%H:%M"),
-            "exit_time":        last["date"].strftime("%H:%M") + "(EOD)",
-            "entry_price":      round(float(entry_row["close"]), 4),
-            "exit_price":       round(float(last["close"]), 4),
-            "pct_change":       pct,
-            "outcome":          "GAIN(EOD)" if pct >= 0 else "LOSS(EOD)",
-            "entry_r_pd":       round(float(entry_row["r_pd"]), 4),
-            "entry_r_ps":       round(float(entry_row["r_ps"]), 4),
-            "entry_sentiment":  round(float(entry_row["score_smooth"]), 4),
-            "entry_msgs_min":   round(float(entry_row["mpm_smooth"]), 4),
-            "exit_r_pd":        round(float(last["r_pd"]), 4),
-            "exit_r_ps":        round(float(last["r_ps"]), 4),
-            "exit_sentiment":   round(float(last["score_smooth"]), 4),
-            "exit_msgs_min":    round(float(last["mpm_smooth"]), 4),
-            "exit_reason":      "EOD — no exit signal triggered",
+            "entry_time":      entry_row["date"].strftime("%H:%M"),
+            "exit_time":       last["date"].strftime("%H:%M") + " (EOD)",
+            "entry_price":     round(float(entry_row["close"]), 4),
+            "exit_price":      round(float(last["close"]), 4),
+            "pct_change":      pct,
+            "outcome":         "GAIN (EOD)" if pct >= 0 else "LOSS (EOD)",
+            "entry_r_pd":      round(float(entry_row["r_pd"]), 4),
+            "entry_r_ps":      round(float(entry_row["r_ps"]), 4),
+            "entry_sentiment": round(float(entry_row["score_smooth"]), 4),
+            "entry_msgs_min":  round(float(entry_row["mpm_smooth"]), 4),
+            "exit_r_pd":       round(float(last["r_pd"]), 4),
+            "exit_r_ps":       round(float(last["r_ps"]), 4),
+            "exit_sentiment":  round(float(last["score_smooth"]), 4),
+            "exit_msgs_min":   round(float(last["mpm_smooth"]), 4),
+            "exit_reason":     "EOD — no exit signal triggered",
         })
 
     return signals
@@ -404,28 +475,28 @@ def find_signals(df, threshold, roll_win, r_lookback,
 all_results = []
 
 for ticker in TICKERS:
-    print(f"  {ticker}...", end=" ", flush=True)
+    print(f"\n── {ticker} ──────────────────────────")
 
     df_price = fetch_price(ticker)
     if df_price is None:
-        print("no price data"); continue
+        print("  no price data"); continue
 
     msgs = fetch_messages(ticker)
     if len(msgs) == 0:
-        print("no messages"); continue
+        print("  no messages"); continue
 
     avg_sentiment, avg_density = compute_avg_sentiment_density(msgs, ROLL_WIN)
 
     win_df = build_rolling_windows(msgs, ROLL_WIN)
     if win_df is None:
-        print("no windows"); continue
+        print("  no windows"); continue
 
     df_price["minute"] = df_price["date"].dt.floor("min")
     df = pd.merge(df_price[["date","minute","close"]], win_df, on="minute", how="inner")
     df = df.dropna(subset=["close"]).reset_index(drop=True)
 
     if len(df) < R_LOOKBACK + 2 or df["density"].max() == 0:
-        print("insufficient overlap"); continue
+        print("  insufficient overlap"); continue
 
     r_pd = safe_r(smooth(df["density"].values,    k=5), smooth(df["close"].values, k=5))
     r_ps = safe_r(smooth(df["norm_score"].values, k=5), smooth(df["close"].values, k=5))
@@ -434,7 +505,7 @@ for ticker in TICKERS:
     signals = find_signals(df, THRESHOLD, ROLL_WIN, R_LOOKBACK,
                            SENT_THRESHOLD, MSG_THRESHOLD)
 
-    print(f"{len(msgs)} msgs | sent={avg_sentiment:+.3f} msg/min={avg_density:.2f} | "
+    print(f"  {len(msgs)} msgs | sent={avg_sentiment:+.3f} msg/min={avg_density:.2f} | "
           f"r_pd={r_pd:+.3f} r_ps={r_ps:+.3f} | {len(signals)} trade(s)")
 
     if not signals:
@@ -464,7 +535,6 @@ for ticker in TICKERS:
         })
     else:
         for sig in signals:
-            sig["ticker"] = ticker
             all_results.append({
                 "ticker":           ticker,
                 "avg_sentiment":    avg_sentiment,
@@ -491,7 +561,7 @@ for ticker in TICKERS:
             })
 
 # ════════════════════════════════════════════════════════════
-# STEP 4 — SAVE CSV WITH SETTINGS AS HEADER ROWS
+# STEP 4 — SAVE CSV WITH SETTINGS AS HEADER
 # ════════════════════════════════════════════════════════════
 if not all_results:
     print("\n⚠️  No data — check date is a trading day and token is valid.")
@@ -525,9 +595,9 @@ else:
     out = (f"{MARKET_CAP}_{DATE_STR}_"
            f"w{ROLL_WIN}_t{str(THRESHOLD).replace('.','p')}_signals.csv")
 
-    # ── Write settings as title rows at top of CSV ────────
+    # Settings block at top of CSV
     with open(out, "w") as f:
-        f.write(f"SETTINGS\n")
+        f.write("SETTINGS\n")
         f.write(f"market_cap,{MARKET_CAP}\n")
         f.write(f"date,{DATE_STR}\n")
         f.write(f"time_range,{START_TIME}–{END_TIME}\n")
@@ -536,10 +606,7 @@ else:
         f.write(f"corr_threshold,{THRESHOLD}\n")
         f.write(f"sent_threshold,{SENT_THRESHOLD}\n")
         f.write(f"msg_threshold,{MSG_THRESHOLD}\n")
-        f.write(f"\n")   # blank row separator
+        f.write("\n")
 
-    # Append actual data below the settings block
     results_df.to_csv(out, mode="a", index=False)
-
-    files.download(out)
     print(f"✅ Saved → {out}")
