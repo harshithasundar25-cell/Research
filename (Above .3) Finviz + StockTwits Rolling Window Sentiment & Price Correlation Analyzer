@@ -1,13 +1,9 @@
 """
 Finviz + StockTwits Rolling Window Sentiment & Price Correlation Analyzer
-==========================================================================
 Uses curl_cffi (curl-impersonate) to bypass Finviz bot detection.
 
 Requirements:
-    pip install curl_cffi pandas scipy requests python-dateutil pytz
-
-Usage:
-    python finviz_sentiment_analysis.py
+    pip install curl_cffi pandas scipy pytz
 """
 
 import os
@@ -15,7 +11,7 @@ import sys
 import time
 import math
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime
 from io import StringIO
 from urllib.parse import quote
 
@@ -26,9 +22,9 @@ from scipy.stats import pearsonr
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 AUTH_TOKEN = "66943a00-454b-4bfb-8b25-53d720772666"
 DOWNLOADS_DIR = os.path.expanduser("~/Downloads")
@@ -66,12 +62,11 @@ RELATIVE_VOLUME_OPTIONS = [
 
 TARGET_TICKERS = 30
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def curl_get(url: str, params: dict = None, timeout: int = 30) -> curl_requests.Response:
-    """GET with curl-impersonate (Chrome 110) to bypass bot detection."""
+def curl_get(url, params=None, timeout=30):
     return curl_requests.get(
         url,
         params=params,
@@ -82,20 +77,16 @@ def curl_get(url: str, params: dict = None, timeout: int = 30) -> curl_requests.
     )
 
 
-def hhmm_to_minutes(hhmm: str) -> int:
+def hhmm_to_minutes(hhmm):
     h, m = map(int, hhmm.split(":"))
     return h * 60 + m
 
 
-def minutes_to_hhmm(minutes: int) -> str:
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+# ---------------------------------------------------------------------------
+# 1. SCREENER
+# ---------------------------------------------------------------------------
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. SCREENER  —  top ~30 tickers for a given market cap
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_screener_url(market_cap: str, relvol_filter: str) -> str:
+def build_screener_url(market_cap, relvol_filter):
     filters = ",".join([
         RAW_CAP_FILTERS[market_cap],
         CURRENT_VOLUME,
@@ -104,55 +95,73 @@ def build_screener_url(market_cap: str, relvol_filter: str) -> str:
     ])
     encoded = quote(filters, safe="")
     return (
-        f"https://elite.finviz.com/export?v=111"
-        f"&f={encoded}&ft=3&auth={AUTH_TOKEN}"
+        "https://elite.finviz.com/export?v=111"
+        "&f=" + encoded + "&ft=3&auth=" + AUTH_TOKEN
     )
 
 
-def get_top_tickers(market_cap: str) -> list[str]:
-    """
-    Iterate relative-volume filters and pick the one whose ticker count is
-    closest to TARGET_TICKERS (≈30).
-    """
-    print(f"\n[Screener] Fetching tickers for market cap: {market_cap}")
-    best_tickers: list[str] = []
+def get_top_tickers(market_cap):
+    print("\n[Screener] Fetching tickers for market cap: " + market_cap)
+    best_tickers = []
     best_diff = float("inf")
 
     for relvol in RELATIVE_VOLUME_OPTIONS:
         url = build_screener_url(market_cap, relvol)
+        print("  [DEBUG] URL: " + url)
         try:
             resp = curl_get(url, timeout=30)
+            print("  [DEBUG] Status: " + str(resp.status_code))
+            preview = resp.text[:300]
+            print("  [DEBUG] Response preview: " + repr(preview))
+
             if resp.status_code != 200:
+                print("  Non-200 for " + relvol + ", skipping.")
                 continue
+
+            if preview.strip().startswith("<!") or preview.strip().lower().startswith("<html"):
+                print("  [DEBUG] Got HTML — likely auth/login redirect. Check your token.")
+                print("  [DEBUG] Full response (500 chars):\n" + resp.text[:500])
+                break
+
             df = pd.read_csv(StringIO(resp.text))
-            if "Ticker" not in df.columns:
+            print("  [DEBUG] CSV columns: " + str(df.columns.tolist()))
+
+            # Case-insensitive column match
+            col_map = {c.strip().lower(): c for c in df.columns}
+            if "ticker" not in col_map:
+                print("  No Ticker column. Columns: " + str(df.columns.tolist()))
                 continue
+            df = df.rename(columns={col_map["ticker"]: "Ticker"})
+
             tickers = df["Ticker"].dropna().astype(str).tolist()
             diff = abs(len(tickers) - TARGET_TICKERS)
-            print(f"  {relvol}: {len(tickers)} tickers")
+            print("  " + relvol + ": " + str(len(tickers)) + " tickers")
             if diff < best_diff:
                 best_diff = diff
                 best_tickers = tickers
+
+            if len(tickers) >= TARGET_TICKERS - 5:
+                break
+
         except Exception as e:
-            print(f"  Warning [{relvol}]: {e}")
+            print("  Warning [" + relvol + "]: " + str(e))
         time.sleep(0.5)
 
-    print(f"  → Selected {len(best_tickers)} tickers")
-    return best_tickers[:50]  # cap at 50 for safety
+    print("  -> Selected " + str(len(best_tickers)) + " tickers")
+    return best_tickers[:50]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. PRICE DATA  —  1-min OHLCV from Finviz quote_export
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 2. PRICE DATA
+# ---------------------------------------------------------------------------
 
-def get_price_data(ticker: str, date: str) -> pd.DataFrame:
-    """
-    Returns a DataFrame with columns [datetime, close] indexed by minute.
-    date: 'YYYY-MM-DD'
-    """
+def get_price_data(ticker, date):
     url = (
-        f"https://elite.finviz.com/quote_export?"
-        f"t={ticker}&p=i1&s={date}&e={date}&auth={AUTH_TOKEN}"
+        "https://elite.finviz.com/quote_export?"
+        "t=" + ticker +
+        "&p=i1&s=" + date +
+        "&e=" + date +
+        "&auth=" + AUTH_TOKEN
     )
     try:
         resp = curl_get(url, timeout=30)
@@ -161,44 +170,31 @@ def get_price_data(ticker: str, date: str) -> pd.DataFrame:
         df = pd.read_csv(StringIO(resp.text))
         df.columns = [c.strip().lower() for c in df.columns]
 
-        dt_col = next(
-            (c for c in df.columns if "date" in c or "time" in c), None
-        )
+        dt_col = next((c for c in df.columns if "date" in c or "time" in c), None)
         if dt_col is None:
             return pd.DataFrame()
 
-        # Strip AM/PM suffix Finviz sometimes adds
-        df[dt_col] = (
-            df[dt_col].astype(str).str.replace(r"\s+(AM|PM)$", "", regex=True)
-        )
-        df[dt_col] = pd.to_datetime(
-            df[dt_col], format="%m/%d/%Y %H:%M", errors="coerce"
-        )
+        df[dt_col] = df[dt_col].astype(str).str.replace(r"\s+(AM|PM)$", "", regex=True)
+        df[dt_col] = pd.to_datetime(df[dt_col], format="%m/%d/%Y %H:%M", errors="coerce")
         df = df.dropna(subset=[dt_col])
         df = df.rename(columns={dt_col: "datetime"})
 
-        # Localize to EST
         if df["datetime"].dt.tz is None:
             df["datetime"] = df["datetime"].dt.tz_localize(EST)
 
         return df[["datetime", "close"]].sort_values("datetime").reset_index(drop=True)
 
     except Exception as e:
-        print(f"    Price fetch error for {ticker}: {e}")
+        print("    Price fetch error for " + ticker + ": " + str(e))
         return pd.DataFrame()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. STOCKTWITS SENTIMENT  —  messages within a date range
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 3. STOCKTWITS SENTIMENT
+# ---------------------------------------------------------------------------
 
-def fetch_stocktwits_messages(ticker: str, date: str) -> pd.DataFrame:
-    """
-    Pull StockTwits messages for a ticker on a given date.
-    Returns DataFrame with [datetime, bull, bear, tagged, total].
-    The public API returns at most ~30 messages per call; we page back.
-    """
-    base = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
+def fetch_stocktwits_messages(ticker, date):
+    base = "https://api.stocktwits.com/api/2/streams/symbol/" + ticker + ".json"
     date_dt = datetime.strptime(date, "%Y-%m-%d")
     day_start = EST.localize(date_dt.replace(hour=0, minute=0, second=0))
     day_end   = EST.localize(date_dt.replace(hour=23, minute=59, second=59))
@@ -208,7 +204,7 @@ def fetch_stocktwits_messages(ticker: str, date: str) -> pd.DataFrame:
     stop = False
     page = 0
 
-    while not stop and page < 40:  # safety cap
+    while not stop and page < 40:
         params = {"limit": 30}
         if max_id:
             params["max"] = max_id
@@ -228,7 +224,6 @@ def fetch_stocktwits_messages(ticker: str, date: str) -> pd.DataFrame:
         for msg in messages:
             raw_ts = msg.get("created_at", "")
             try:
-                # StockTwits returns UTC ISO-8601
                 ts_utc = datetime.strptime(raw_ts, "%Y-%m-%dT%H:%M:%SZ")
                 ts_utc = pytz.utc.localize(ts_utc)
                 ts_est = ts_utc.astimezone(EST)
@@ -243,16 +238,16 @@ def fetch_stocktwits_messages(ticker: str, date: str) -> pd.DataFrame:
 
             sentiment = (msg.get("entities") or {}).get("sentiment") or {}
             label = (sentiment.get("basic") or "").lower()
-            bull = 1 if label == "bullish" else 0
-            bear = 1 if label == "bearish" else 0
+            bull   = 1 if label == "bullish" else 0
+            bear   = 1 if label == "bearish" else 0
             tagged = 1 if label in ("bullish", "bearish") else 0
 
             rows.append({
                 "datetime": ts_est,
-                "bull":    bull,
-                "bear":    bear,
-                "tagged":  tagged,
-                "total":   1,
+                "bull":     bull,
+                "bear":     bear,
+                "tagged":   tagged,
+                "total":    1,
             })
 
         max_id = messages[-1].get("id")
@@ -262,31 +257,20 @@ def fetch_stocktwits_messages(ticker: str, date: str) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["datetime", "bull", "bear", "tagged", "total"])
 
-    df = pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
-    return df
+    return pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. ROLLING WINDOW CALCULATIONS
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 4. ROLLING WINDOWS
+# ---------------------------------------------------------------------------
 
 def calc_sentiment_score(bull, bear, tagged, total, max_weight=1.0):
-    """
-    score = [(Bull - Bear) / Tagged × log(1 + Total)] / max_weight
-    Returns NaN if tagged == 0.
-    """
     if tagged == 0 or max_weight == 0:
         return float("nan")
     return ((bull - bear) / tagged * math.log(1 + total)) / max_weight
 
 
-def build_rolling_windows(
-    start_hhmm: str,
-    end_hhmm: str,
-    window_minutes: int,
-    date: str,
-) -> list[tuple[datetime, datetime]]:
-    """Generate rolling 1-min step windows within [start, end]."""
+def build_rolling_windows(start_hhmm, end_hhmm, window_minutes, date):
     base = datetime.strptime(date, "%Y-%m-%d")
     start_min = hhmm_to_minutes(start_hhmm)
     end_min   = hhmm_to_minutes(end_hhmm)
@@ -294,110 +278,48 @@ def build_rolling_windows(
     windows = []
     cur = start_min
     while cur + window_minutes <= end_min + 1:
-        w_start = EST.localize(
-            base.replace(hour=cur // 60, minute=cur % 60, second=0)
-        )
-        w_end = EST.localize(
-            base.replace(
-                hour=(cur + window_minutes) // 60,
-                minute=(cur + window_minutes) % 60,
-                second=0,
-            )
-        )
-        windows.append((w_start, w_end))
+        ws = EST.localize(base.replace(hour=cur // 60, minute=cur % 60, second=0))
+        we = EST.localize(base.replace(
+            hour=(cur + window_minutes) // 60,
+            minute=(cur + window_minutes) % 60,
+            second=0,
+        ))
+        windows.append((ws, we))
         cur += 1
     return windows
 
 
-def window_metrics(
-    price_df: pd.DataFrame,
-    msg_df: pd.DataFrame,
-    w_start: datetime,
-    w_end: datetime,
-    window_minutes: int,
-    max_weight: float,
-) -> dict:
-    """Compute metrics for a single rolling window."""
-    # Price slice
-    p = price_df[
-        (price_df["datetime"] >= w_start) & (price_df["datetime"] < w_end)
-    ]
-    # Message slice
-    m = msg_df[
-        (msg_df["datetime"] >= w_start) & (msg_df["datetime"] < w_end)
-    ]
-
-    price_open  = p["close"].iloc[0]  if len(p) >= 1 else float("nan")
-    price_close = p["close"].iloc[-1] if len(p) >= 1 else float("nan")
-
-    total_msgs  = int(m["total"].sum())
-    bull        = int(m["bull"].sum())
-    bear        = int(m["bear"].sum())
-    tagged      = int(m["tagged"].sum())
-    msg_per_min = total_msgs / window_minutes if window_minutes > 0 else float("nan")
-
-    score = calc_sentiment_score(bull, bear, tagged, total_msgs, max_weight)
-
-    return {
-        "w_start":      w_start,
-        "w_end":        w_end,
-        "price_open":   price_open,
-        "price_close":  price_close,
-        "total_msgs":   total_msgs,
-        "bull":         bull,
-        "bear":         bear,
-        "tagged":       tagged,
-        "msg_per_min":  msg_per_min,
-        "sentiment":    score,
-    }
-
-
-def safe_corr(x, y) -> float:
-    """Pearson r; returns NaN if insufficient data."""
-    x = [v for v, w in zip(x, y) if not math.isnan(v) and not math.isnan(w)]
-    y = [w for v, w in zip(x, y) if not math.isnan(v) and not math.isnan(w)]
-    if len(x) < 3:
+def safe_corr(x, y):
+    pairs = [(a, b) for a, b in zip(x, y) if not math.isnan(a) and not math.isnan(b)]
+    if len(pairs) < 3:
         return float("nan")
+    xs, ys = zip(*pairs)
     try:
-        r, _ = pearsonr(x, y)
+        r, _ = pearsonr(xs, ys)
         return r
     except Exception:
         return float("nan")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # 5. TRADE SIGNAL LOGIC
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def find_trade_signals(
-    ticker: str,
-    all_windows: list[dict],
-    corr_threshold: float | None,
-    msg_threshold: float | None,
-    use_corr: bool,
-    use_msg: bool,
-) -> list[dict]:
-    """
-    Scan rolling windows in order. Enter when conditions are met; exit when any
-    condition fails. Returns a list of completed trades.
-    """
+def find_trade_signals(ticker, all_windows, corr_threshold, msg_threshold, use_corr, use_msg):
     trades = []
     in_trade = False
     entry_idx = None
 
-    # Pre-compute per-window rolling correlations (need ≥3 windows look-back)
-    prices      = [w["price_close"] for w in all_windows]
-    densities   = [w["msg_per_min"] for w in all_windows]
-    sentiments  = [w["sentiment"]   for w in all_windows]
+    prices     = [w["price_close"] for w in all_windows]
+    densities  = [w["msg_per_min"] for w in all_windows]
+    sentiments = [w["sentiment"]   for w in all_windows]
 
-    corr_pd = []   # price vs density
-    corr_ps = []   # price vs sentiment
+    corr_pd = []
+    corr_ps = []
     for i in range(len(all_windows)):
-        lo = max(0, i - 9)  # 10-window look-back for correlation
-        r_pd = safe_corr(prices[lo:i+1], densities[lo:i+1])
-        r_ps = safe_corr(prices[lo:i+1], sentiments[lo:i+1])
-        corr_pd.append(r_pd)
-        corr_ps.append(r_ps)
+        lo = max(0, i - 9)
+        corr_pd.append(safe_corr(prices[lo:i+1], densities[lo:i+1]))
+        corr_ps.append(safe_corr(prices[lo:i+1], sentiments[lo:i+1]))
 
     for i, w in enumerate(all_windows):
         price_rising = (
@@ -405,6 +327,7 @@ def find_trade_signals(
             and not math.isnan(w["price_close"])
             and w["price_close"] > w["price_open"]
         )
+
         corr_ok = True
         msg_ok  = True
 
@@ -412,10 +335,8 @@ def find_trade_signals(
             r_pd = corr_pd[i]
             r_ps = corr_ps[i]
             corr_ok = (
-                not math.isnan(r_pd)
-                and not math.isnan(r_ps)
-                and r_pd >= corr_threshold
-                and r_ps >= corr_threshold
+                not math.isnan(r_pd) and not math.isnan(r_ps)
+                and r_pd >= corr_threshold and r_ps >= corr_threshold
             )
 
         if use_msg and msg_threshold is not None:
@@ -424,26 +345,33 @@ def find_trade_signals(
                 and w["msg_per_min"] >= msg_threshold
             )
 
-        # Entry condition
         if not in_trade:
-            entry_signal = price_rising and (corr_ok or msg_ok)
-            if entry_signal:
+            # Require price rising AND every active signal must pass
+            active_signals_ok = True
+            if use_corr and corr_threshold is not None:
+                active_signals_ok = active_signals_ok and corr_ok
+            if use_msg and msg_threshold is not None:
+                active_signals_ok = active_signals_ok and msg_ok
+            if price_rising and active_signals_ok:
                 in_trade  = True
                 entry_idx = i
-
-        # Exit condition (evaluate even on entry bar)
         else:
             exit_reason = None
             if not price_rising:
                 exit_reason = "price_decreasing"
             elif use_corr and not corr_ok:
-                exit_reason = f"corr_below_{corr_threshold}"
+                exit_reason = "corr_below_" + str(corr_threshold)
             elif use_msg and not msg_ok:
-                exit_reason = f"msg_below_{msg_threshold}"
+                exit_reason = "msg_below_" + str(msg_threshold)
 
             if exit_reason or i == len(all_windows) - 1:
                 if exit_reason is None:
                     exit_reason = "end_of_window"
+                # Skip single-window flickers
+                if i == entry_idx:
+                    in_trade = False
+                    entry_idx = None
+                    continue
 
                 entry_w = all_windows[entry_idx]
                 exit_w  = all_windows[i]
@@ -455,38 +383,34 @@ def find_trade_signals(
                     if entry_price and entry_price != 0 else float("nan")
                 )
 
-                # Aggregate sentiment between entry and exit
                 trade_windows = all_windows[entry_idx:i+1]
-                total_m   = sum(tw["total_msgs"]  for tw in trade_windows)
-                total_b   = sum(tw["bull"]        for tw in trade_windows)
-                total_br  = sum(tw["bear"]        for tw in trade_windows)
-                total_t   = sum(tw["tagged"]      for tw in trade_windows)
-                avg_mpm   = sum(tw["msg_per_min"] for tw in trade_windows) / len(trade_windows)
+                total_m  = sum(tw["total_msgs"]  for tw in trade_windows)
+                total_b  = sum(tw["bull"]        for tw in trade_windows)
+                total_br = sum(tw["bear"]        for tw in trade_windows)
+                total_t  = sum(tw["tagged"]      for tw in trade_windows)
+                avg_mpm  = sum(tw["msg_per_min"] for tw in trade_windows) / len(trade_windows)
 
-                # Recompute max_weight across all windows for normalisation
                 max_weight = max(
                     (abs((tw["bull"] - tw["bear"]) / tw["tagged"] * math.log(1 + tw["total_msgs"]))
                      for tw in trade_windows if tw["tagged"] > 0),
                     default=1.0,
                 )
-                trade_sentiment = calc_sentiment_score(
-                    total_b, total_br, total_t, total_m, max_weight
-                )
+                trade_sentiment = calc_sentiment_score(total_b, total_br, total_t, total_m, max_weight)
 
                 trades.append({
-                    "ticker":             ticker,
-                    "entry_window":       entry_w["w_start"].strftime("%H:%M"),
-                    "exit_window":        exit_w["w_end"].strftime("%H:%M"),
-                    "entry_price":        round(entry_price, 4) if not math.isnan(entry_price) else None,
-                    "exit_price":         round(exit_price,  4) if not math.isnan(exit_price)  else None,
-                    "pct_change":         round(pct_change,  4) if not math.isnan(pct_change)  else None,
-                    "entry_corr_price_density":    round(corr_pd[entry_idx], 4) if not math.isnan(corr_pd[entry_idx]) else None,
-                    "entry_corr_price_sentiment":  round(corr_ps[entry_idx], 4) if not math.isnan(corr_ps[entry_idx]) else None,
-                    "exit_corr_price_density":     round(corr_pd[i], 4)         if not math.isnan(corr_pd[i])         else None,
-                    "exit_corr_price_sentiment":   round(corr_ps[i], 4)         if not math.isnan(corr_ps[i])         else None,
-                    "avg_msg_per_min":    round(avg_mpm,        4) if not math.isnan(avg_mpm)  else None,
-                    "trade_sentiment":    round(trade_sentiment, 4) if not math.isnan(trade_sentiment) else None,
-                    "exit_reason":        exit_reason,
+                    "ticker":                       ticker,
+                    "entry_window":                 entry_w["w_start"].strftime("%H:%M"),
+                    "exit_window":                  exit_w["w_end"].strftime("%H:%M"),
+                    "entry_price":                  round(entry_price, 4) if not math.isnan(entry_price) else None,
+                    "exit_price":                   round(exit_price,  4) if not math.isnan(exit_price)  else None,
+                    "pct_change":                   round(pct_change,  4) if not math.isnan(pct_change)  else None,
+                    "entry_corr_price_density":     round(corr_pd[entry_idx], 4) if not math.isnan(corr_pd[entry_idx]) else None,
+                    "entry_corr_price_sentiment":   round(corr_ps[entry_idx], 4) if not math.isnan(corr_ps[entry_idx]) else None,
+                    "exit_corr_price_density":      round(corr_pd[i], 4)         if not math.isnan(corr_pd[i])         else None,
+                    "exit_corr_price_sentiment":    round(corr_ps[i], 4)         if not math.isnan(corr_ps[i])         else None,
+                    "avg_msg_per_min":              round(avg_mpm,        4) if not math.isnan(avg_mpm)          else None,
+                    "trade_sentiment":              round(trade_sentiment, 4) if not math.isnan(trade_sentiment)  else None,
+                    "exit_reason":                  exit_reason,
                 })
                 in_trade  = False
                 entry_idx = None
@@ -494,102 +418,98 @@ def find_trade_signals(
     return trades
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # 6. USER INPUT
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def prompt(label: str, default: str = "") -> str:
-    val = input(f"{label}: ").strip()
-    return val if val else default
-
-
-def get_user_inputs() -> dict:
+def get_user_inputs():
     print("\n" + "=" * 60)
     print("  Finviz + StockTwits Sentiment / Price Correlation Tool")
     print("=" * 60)
 
     market_cap = ""
     while market_cap not in RAW_CAP_FILTERS:
-        market_cap = prompt(
-            f"Market cap ({'/'.join(RAW_CAP_FILTERS.keys())})"
-        ).lower()
+        market_cap = input("Market cap (mega/large/mid/small/micro/nano): ").strip().lower()
 
-    date = prompt("Date (YYYY-MM-DD)")
+    date = input("Date (YYYY-MM-DD): ").strip()
+    entry_time = input("Entry time (HH:MM, 24-hr EST, e.g. 09:30): ").strip()
+    exit_time  = input("Exit time  (HH:MM, 24-hr EST, e.g. 16:00): ").strip()
+    window_minutes = int(input("Rolling window size in minutes (e.g. 5): ").strip())
 
-    entry_time = prompt("Entry time (HH:MM, 24-hr EST, e.g. 09:30)")
-    exit_time  = prompt("Exit time  (HH:MM, 24-hr EST, e.g. 16:00)")
-
-    window_minutes = int(prompt("Rolling window size in minutes (e.g. 5)"))
-
-    # Correlation threshold
-    corr_raw = prompt(
-        "Correlation threshold (0-1, or 'no' to skip correlation as signal)"
-    ).lower()
+    corr_raw = input("Correlation threshold 0-1 (or 'no' to skip): ").strip().lower()
     use_corr       = corr_raw != "no"
     corr_threshold = float(corr_raw) if use_corr else None
 
-    # Messages-per-minute threshold
-    msg_raw = prompt(
-        "Messages-per-minute threshold (e.g. 2.0, or 'no' to skip)"
-    ).lower()
+    msg_raw = input("Messages-per-minute threshold (or 'no' to skip): ").strip().lower()
     use_msg       = msg_raw != "no"
     msg_threshold = float(msg_raw) if use_msg else None
 
     return {
-        "market_cap":      market_cap,
-        "date":            date,
-        "entry_time":      entry_time,
-        "exit_time":       exit_time,
-        "window_minutes":  window_minutes,
-        "use_corr":        use_corr,
-        "corr_threshold":  corr_threshold,
-        "use_msg":         use_msg,
-        "msg_threshold":   msg_threshold,
+        "market_cap":     market_cap,
+        "date":           date,
+        "entry_time":     entry_time,
+        "exit_time":      exit_time,
+        "window_minutes": window_minutes,
+        "use_corr":       use_corr,
+        "corr_threshold": corr_threshold,
+        "use_msg":        use_msg,
+        "msg_threshold":  msg_threshold,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # 7. MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def main():
     cfg = get_user_inputs()
 
-    # ── Step 1: get tickers ──────────────────────────────────────────────────
+    # Step 1: get tickers
     tickers = get_top_tickers(cfg["market_cap"])
     if not tickers:
-        print("No tickers found. Exiting.")
-        sys.exit(1)
+        print("\n[!] Screener returned 0 tickers.")
+        print("    This usually means the auth token is rejected (login redirect).")
+        print("    You can manually enter tickers to continue, or press Enter to exit.\n")
+        manual = input("Enter tickers comma-separated (e.g. AAPL,TSLA,NVDA) or press Enter to exit: ").strip()
+        if not manual:
+            print("Exiting.")
+            sys.exit(1)
+        tickers = [t.strip().upper() for t in manual.split(",") if t.strip()]
+        print("Using manual tickers: " + str(tickers))
 
     windows_meta = build_rolling_windows(
-        cfg["entry_time"],
-        cfg["exit_time"],
-        cfg["window_minutes"],
-        cfg["date"],
+        cfg["entry_time"], cfg["exit_time"],
+        cfg["window_minutes"], cfg["date"],
     )
-    print(f"\n[Windows] {len(windows_meta)} rolling windows "
-          f"({cfg['entry_time']} → {cfg['exit_time']}, {cfg['window_minutes']}min each)")
+    print("\n[Windows] " + str(len(windows_meta)) + " rolling windows ("
+          + cfg["entry_time"] + " -> " + cfg["exit_time"]
+          + ", " + str(cfg["window_minutes"]) + "min each)")
 
-    all_trades: list[dict] = []
+    all_trades = []
 
     for ticker in tickers:
-        print(f"\n[{ticker}] Fetching price & sentiment data…")
+        print("\n[" + ticker + "] Fetching price & sentiment data...")
 
         price_df = get_price_data(ticker, cfg["date"])
         msg_df   = fetch_stocktwits_messages(ticker, cfg["date"])
 
         if price_df.empty:
-            print(f"  No price data — skipping.")
+            print("  No price data - skipping.")
+            continue
+
+        total_msgs_for_ticker = int(msg_df["total"].sum()) if not msg_df.empty else 0
+        if total_msgs_for_ticker == 0 and (cfg["use_corr"] or cfg["use_msg"]):
+            print("  No StockTwits messages found - skipping (no data to correlate).")
             continue
 
         # Compute max_weight across all windows for normalisation
         all_msg_windows = []
         for ws, we in windows_meta:
-            m = msg_df[(msg_df["datetime"] >= ws) & (msg_df["datetime"] < we)]
-            b  = int(m["bull"].sum())   if not msg_df.empty else 0
-            br = int(m["bear"].sum())   if not msg_df.empty else 0
-            t  = int(m["tagged"].sum()) if not msg_df.empty else 0
-            tot = int(m["total"].sum()) if not msg_df.empty else 0
+            m = msg_df[(msg_df["datetime"] >= ws) & (msg_df["datetime"] < we)] if not msg_df.empty else pd.DataFrame()
+            b   = int(m["bull"].sum())   if not m.empty else 0
+            br  = int(m["bear"].sum())   if not m.empty else 0
+            t   = int(m["tagged"].sum()) if not m.empty else 0
+            tot = int(m["total"].sum())  if not m.empty else 0
             all_msg_windows.append((b, br, t, tot))
 
         max_weight = max(
@@ -598,15 +518,12 @@ def main():
             default=1.0,
         )
 
-        # Build per-window metrics
         window_data = []
         for (ws, we), (b, br, t, tot) in zip(windows_meta, all_msg_windows):
-            p = price_df[
-                (price_df["datetime"] >= ws) & (price_df["datetime"] < we)
-            ]
+            p  = price_df[(price_df["datetime"] >= ws) & (price_df["datetime"] < we)]
             po = p["close"].iloc[0]  if len(p) >= 1 else float("nan")
             pc = p["close"].iloc[-1] if len(p) >= 1 else float("nan")
-            mpm = tot / cfg["window_minutes"]
+            mpm   = tot / cfg["window_minutes"]
             score = calc_sentiment_score(b, br, t, tot, max_weight)
 
             window_data.append({
@@ -623,42 +540,36 @@ def main():
             })
 
         trades = find_trade_signals(
-            ticker,
-            window_data,
-            cfg["corr_threshold"],
-            cfg["msg_threshold"],
-            cfg["use_corr"],
-            cfg["use_msg"],
+            ticker, window_data,
+            cfg["corr_threshold"], cfg["msg_threshold"],
+            cfg["use_corr"], cfg["use_msg"],
         )
         all_trades.extend(trades)
-        print(f"  → {len(trades)} trade signal(s) found")
+        print("  -> " + str(len(trades)) + " trade signal(s) found")
         time.sleep(0.5)
 
-    # ── Step 2: filter and save ──────────────────────────────────────────────
+    # Step 2: filter and save
     if not all_trades:
         print("\nNo trades found across all tickers.")
         sys.exit(0)
 
     df_trades = pd.DataFrame(all_trades)
-
-    # Keep only rows where |pct_change| > 0.3 %
     df_filtered = df_trades[
         df_trades["pct_change"].apply(
             lambda x: abs(x) > 0.3 if x is not None and not math.isnan(x) else False
         )
     ].reset_index(drop=True)
 
-    print(f"\n[Results] {len(df_filtered)} trades with |pct_change| > 0.3%")
+    print("\n[Results] " + str(len(df_filtered)) + " trades with |pct_change| > 0.3%")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path  = os.path.join(
         DOWNLOADS_DIR,
-        f"sentiment_corr_{cfg['market_cap']}_{cfg['date']}_{timestamp}.csv",
+        "sentiment_corr_" + cfg["market_cap"] + "_" + cfg["date"] + "_" + timestamp + ".csv",
     )
     df_filtered.to_csv(out_path, index=False)
-    print(f"\n✓ Saved to: {out_path}")
+    print("\nSaved to: " + out_path)
 
-    # Pretty print summary
     if not df_filtered.empty:
         cols = [
             "ticker", "entry_window", "exit_window",
