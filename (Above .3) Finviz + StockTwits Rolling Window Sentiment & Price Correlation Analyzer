@@ -556,7 +556,7 @@ def main():
     df_trades = pd.DataFrame(all_trades)
     df_filtered = df_trades[
         df_trades["pct_change"].apply(
-            lambda x: abs(x) > 0.3 if x is not None and not math.isnan(x) else False
+            lambda x: x > 0.3 if x is not None and not math.isnan(x) else False
         )
     ].reset_index(drop=True)
 
