@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # ---------------------------------------------------------------------------
 
-AUTH_TOKEN = "66943a00-454b-4bfb-8b25-53d720772666"
+AUTH_TOKEN = "b9170d44-8597-4b20-81ce-b6d9c6b57ecf"
 DOWNLOADS_DIR = os.path.expanduser("~/Downloads")
 EST = pytz.timezone("America/New_York")
 
@@ -556,7 +556,7 @@ def main():
     df_trades = pd.DataFrame(all_trades)
     df_filtered = df_trades[
         df_trades["pct_change"].apply(
-            lambda x: x > 0.3 if x is not None and not math.isnan(x) else False
+            lambda x: x > 3.0 if x is not None and not math.isnan(x) else False
         )
     ].reset_index(drop=True)
 
