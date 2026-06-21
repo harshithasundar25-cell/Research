@@ -1,5 +1,5 @@
-!pip install curl_cffi beautifulsoup4 -q
-import time, io, re, getpass, requests
+!pip install curl_cffi -q
+import time, io, requests
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -7,427 +7,413 @@ from zoneinfo import ZoneInfo
 from curl_cffi import requests as cffi_requests
 from collections import defaultdict
 from scipy import stats
-from urllib.parse import quote
-from bs4 import BeautifulSoup
 from google.colab import files
-
-# ════════════════════════════════════════════════════════════
-# AUTO-LOGIN
-# ════════════════════════════════════════════════════════════
-def get_auth_token(email, password):
-    LOGIN_URL   = "https://finviz.com/login_submit.ashx"
-    ACCOUNT_URL = "https://elite.finviz.com/account.ashx"
-    H = {
-        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36",
-        "Referer":      "https://finviz.com/login",
-        "Origin":       "https://finviz.com",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    s    = requests.Session()
-    resp = s.post(LOGIN_URL, data={"email":email,"password":password,"remember":"on"},
-                  headers=H, timeout=20, allow_redirects=True)
-    if resp.status_code not in (200, 302):
-        raise RuntimeError(f"Login HTTP {resp.status_code}")
-    if "login" in resp.url.lower() and "account" not in resp.url.lower():
-        raise RuntimeError("Wrong email or password.")
-    ar = s.get(ACCOUNT_URL, headers={**H,"Referer":"https://finviz.com/"}, timeout=20)
-    if ar.status_code != 200:
-        raise RuntimeError(f"Account page HTTP {ar.status_code}")
-    soup = BeautifulSoup(ar.text, "html.parser")
-    for tag in soup.find_all("input"):
-        v = tag.get("value","")
-        if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",v,re.I):
-            return v
-    uuids = re.findall(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        ar.text, re.I)
-    pl = ar.text.lower()
-    for u in uuids:
-        ctx = pl[max(0,pl.find(u.lower())-100):pl.find(u.lower())+100]
-        if any(k in ctx for k in ("api","auth","token","key","export")):
-            return u
-    if uuids: return uuids[0]
-    raise RuntimeError("Token not found on account page.")
-
-def login_and_get_token():
-    print("─"*50)
-    print("  Finviz Elite — auto-login")
-    print("─"*50)
-    email    = input("  Email   : ").strip()
-    password = getpass.getpass("  Password: ")
-    print("  Logging in...", end=" ", flush=True)
-    try:
-        tok = get_auth_token(email, password)
-        print(f"✅  Token: {tok[:8]}…{tok[-4:]}")
-        return tok
-    except RuntimeError as e:
-        print(f"\n  ❌ {e}\n  Falling back to manual entry.")
-        return input("  Paste your auth token: ").strip()
 
 # ════════════════════════════════════════════════════════════
 # CONFIG
 # ════════════════════════════════════════════════════════════
-RAW_CAP_FILTERS = {
-    "mega":"cap_mega","large":"cap_large","mid":"cap_mid",
-    "small":"cap_small","micro":"cap_micro","nano":"cap_nano",
-}
-CHANGE_FILTERS = {
-    "mega":"ta_change_u1","large":"ta_change_u1",
-    "mid":"ta_change_u5","small":"ta_change_u5",
-    "micro":"ta_change_u10","nano":"ta_change_u10",
-}
-RELVOL_OPTIONS = [
-    "sh_relvol_o0.75","sh_relvol_o1","sh_relvol_o1.5",
-    "sh_relvol_o2","sh_relvol_o3","sh_relvol_o5","sh_relvol_o10",
-]
-WINDOW_RANGE = {
-    "nano":(5,30),"micro":(5,60),"small":(5,120),
-    "mid":(5,180),"large":(5,240),"mega":(5,240),
-}
-TARGET_TICKERS = 30
-EDT            = ZoneInfo("America/New_York")
+AUTH_TOKEN = "PASTE_YOUR_FINVIZ_TOKEN_HERE"
+EDT        = ZoneInfo("America/New_York")
 
-# Window step size — smaller = finer search, slower runtime
-WIN_STEP = 5
+START_TIME = "04:00"
+END_TIME   = "20:00"
 
-# ════════════════════════════════════════════════════════════
-# USER INPUT
-# ════════════════════════════════════════════════════════════
-AUTH_TOKEN = login_and_get_token()
-print()
+# ── User inputs ────────────────────────────────────────────
+print("Upload a CSV file containing your tickers (any column named 'ticker'/'symbol', or first column).")
+uploaded = files.upload()
+csv_name = next(iter(uploaded))
+df_tickers = pd.read_csv(io.BytesIO(uploaded[csv_name]))
 
-MARKET_CAP = input("Market cap (mega/large/mid/small/micro/nano): ").strip().lower()
-DATE_STR   = input("Date (YYYY-MM-DD): ").strip()
-START_TIME = input("Start time (HH:MM, 24h): ").strip()
-END_TIME   = input("End time   (HH:MM, 24h): ").strip()
+ticker_col = next(
+    (c for c in df_tickers.columns if c.strip().lower() in ("ticker", "tickers", "symbol", "symbols")),
+    df_tickers.columns[0]
+)
+TICKERS = (
+    df_tickers[ticker_col]
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .str.upper()
+    .unique()
+    .tolist()
+)
+
+DATE_STR    = input("Date (YYYY-MM-DD): ").strip()
+WINDOW_MIN  = 15  # fixed rolling window size in minutes
 
 date_parts   = [int(x) for x in DATE_STR.split("-")]
-WINDOW_START = datetime(date_parts[0], date_parts[1], date_parts[2],
-                        int(START_TIME[:2]), int(START_TIME[3:]), 0, tzinfo=EDT)
-WINDOW_END   = datetime(date_parts[0], date_parts[1], date_parts[2],
-                        int(END_TIME[:2]),   int(END_TIME[3:]),   0, tzinfo=EDT)
-WIN_MIN, WIN_MAX = WINDOW_RANGE[MARKET_CAP]
+WINDOW_START = datetime(date_parts[0], date_parts[1], date_parts[2], 4,  0, 0, tzinfo=EDT)
+WINDOW_END   = datetime(date_parts[0], date_parts[1], date_parts[2], 20, 0, 0, tzinfo=EDT)
 
-# Clip WIN_MAX so we can't search windows longer than the time range itself
-session_mins = int((WINDOW_END - WINDOW_START).total_seconds() / 60)
-WIN_MAX      = min(WIN_MAX, session_mins - 5)
-
-n_windows    = len(range(WIN_MIN, WIN_MAX + 1, WIN_STEP))
-print(f"\n✅  {MARKET_CAP.upper()} | {DATE_STR} | {START_TIME}–{END_TIME}")
-print(f"    Searching {n_windows} window sizes ({WIN_MIN}–{WIN_MAX} min, step {WIN_STEP})\n")
+print(f"\n✅ {len(TICKERS)} tickers | {DATE_STR} | window = {WINDOW_MIN} mins\n")
 
 # ════════════════════════════════════════════════════════════
-# STEP 1 — FETCH TICKERS
+# HELPERS
 # ════════════════════════════════════════════════════════════
-def fetch_tickers(market_cap):
-    best, best_diff = [], float("inf")
-    def try_url(f_str):
-        nonlocal best, best_diff
-        url = (f"https://elite.finviz.com/export?v=111"
-               f"&f={quote(f_str, safe='')}&ft=3&auth={AUTH_TOKEN}")
-        try:
-            r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
-            if r.status_code == 401: print("  ❌ Token expired"); return False
-            if r.status_code != 200: return True
-            df = pd.read_csv(io.StringIO(r.text))
-            if "Ticker" not in df.columns: return True
-            t  = df["Ticker"].dropna().astype(str).tolist()
-            d  = abs(len(t) - TARGET_TICKERS)
-            print(f"  [{f_str[:55]}] → {len(t)}")
-            if d < best_diff: best_diff, best = d, t
-        except Exception as e: print(f"  err: {e}")
-        return True
-
-    cap, chg = RAW_CAP_FILTERS[market_cap], CHANGE_FILTERS[market_cap]
-    for rv in RELVOL_OPTIONS:
-        if not try_url(f"{cap},sh_curvol_o100,{rv},{chg}"): return []
-        time.sleep(0.3)
-    if best: return best
-    for rv in RELVOL_OPTIONS:
-        try_url(f"{cap},sh_curvol_o100,{rv}"); time.sleep(0.3)
-    if best: return best
-    for rv in RELVOL_OPTIONS:
-        try_url(f"{cap},sh_curvol_o50,{rv}"); time.sleep(0.3)
-    if best: return best
-    try_url(cap)
-    if best: return best
-    try:
-        r  = requests.get(
-            f"https://elite.finviz.com/export?v=111&f={cap}&ft=3&auth={AUTH_TOKEN}",
-            headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
-        df = pd.read_csv(io.StringIO(r.text))
-        if "Ticker" in df.columns:
-            best = df["Ticker"].dropna().astype(str).tolist()[:TARGET_TICKERS]
-    except: pass
-    return best
-
-print("Scanning Finviz...")
-TICKERS = fetch_tickers(MARKET_CAP)
-print(f"\n✅  {len(TICKERS)} tickers found\n")
-if not TICKERS:
-    raise RuntimeError("No tickers found.")
-
-# ════════════════════════════════════════════════════════════
-# STEP 2 — HELPERS
-# ════════════════════════════════════════════════════════════
-def parse_ts(s):
-    return datetime.fromisoformat(s.replace("Z","+00:00"))
+def parse_ts(ts_str):
+    return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
 
 def extract_sentiment(msg):
-    raw = msg.get("entities",{}).get("sentiment",None)
-    return raw.get("basic","None") if raw else "None"
+    raw = msg.get("entities", {}).get("sentiment", None)
+    return raw.get("basic", "None") if raw else "None"
 
 def safe_r(a, b):
-    a,b = np.array(a,float), np.array(b,float)
-    if len(a)<5 or a.std()==0 or b.std()==0: return 0.0
-    r,_ = stats.pearsonr(a,b)
-    return round(float(r),4)
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    if len(a) < 5 or a.std() == 0 or b.std() == 0: return 0.0
+    r, _ = stats.pearsonr(a, b)
+    return round(float(r), 4)
 
 def smooth(arr, k=5):
     arr = list(arr)
-    if len(arr)<k: return arr
-    return np.convolve(arr,np.ones(k)/k,mode="same").tolist()
+    if len(arr) < k: return arr
+    return np.convolve(arr, np.ones(k)/k, mode='same').tolist()
 
 def fetch_price(ticker):
     url = f"https://elite.finviz.com/quote_export?t={ticker}&p=i1&auth={AUTH_TOKEN}"
     try:
-        r = requests.get(url,headers={"User-Agent":"Mozilla/5.0"},timeout=15)
-        if r.status_code != 200: return None
-        df = pd.read_csv(io.StringIO(r.text))
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if resp.status_code != 200: return None
+        df = pd.read_csv(io.StringIO(resp.text))
         df.columns = [c.strip().lower() for c in df.columns]
-        dc = next((c for c in df.columns if "date" in c or "time" in c),None)
-        if dc is None: return None
-        df["date"] = pd.to_datetime(df[dc].astype(str),
-                                    format="%m/%d/%Y %I:%M %p",errors="coerce")
+        dt_col = next((c for c in df.columns if "date" in c or "time" in c), None)
+        if dt_col is None: return None
+
+        df["date"] = pd.to_datetime(df[dt_col].astype(str),
+                                    format="%m/%d/%Y %I:%M %p", errors="coerce")
         if df["date"].isna().all():
-            df["date"] = pd.to_datetime(
-                df[dc].astype(str).str.replace(r"\s+(AM|PM)$","",regex=True),
-                format="%m/%d/%Y %H:%M",errors="coerce")
+            df["date"] = pd.to_datetime(df[dt_col].astype(str),
+                                        format="%m/%d/%Y %H:%M", errors="coerce")
         df = df.dropna(subset=["date"])
-        if len(df)==0: return None
-        s = pd.Timestamp(f"{DATE_STR} {START_TIME}:00")
-        e = pd.Timestamp(f"{DATE_STR} {END_TIME}:00")
-        df = df[(df["date"]>=s)&(df["date"]<=e)].copy()
+        if len(df) == 0: return None
+
+        start_dt = pd.Timestamp(f"{DATE_STR} {START_TIME}:00")
+        end_dt   = pd.Timestamp(f"{DATE_STR} {END_TIME}:00")
+        df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)].copy()
         df = df[["date","close"]].sort_values("date").reset_index(drop=True)
-        return df if len(df)>=5 else None
-    except: return None
+        return df if len(df) >= 5 else None
+    except:
+        return None
 
 def fetch_messages(ticker):
-    url  = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
-    hdrs = {"Accept":"application/json",
-            "Referer":f"https://stocktwits.com/symbol/{ticker}",
-            "Origin":"https://stocktwits.com"}
-    sess,out,max_id,stop,pg = cffi_requests.Session(),[],None,False,0
-    while not stop and pg<50:
-        pg+=1
+    api_url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
+    headers = {"Accept": "application/json",
+               "Referer": f"https://stocktwits.com/symbol/{ticker}",
+               "Origin": "https://stocktwits.com"}
+    session, collected, max_id, stop, page = cffi_requests.Session(), [], None, False, 0
+    while not stop and page < 50:
+        page += 1
         try:
-            params={"limit":30}
-            if max_id: params["max"]=max_id
-            data = sess.get(url,headers=hdrs,params=params,
-                            timeout=20,impersonate="chrome136").json()
-            msgs = data.get("messages",[])
-            if not msgs: break
-            last_dt = parse_ts(msgs[-1]["created_at"]).astimezone(EDT)
+            params = {"limit": 30}
+            if max_id: params["max"] = max_id
+            data     = session.get(api_url, headers=headers, params=params,
+                                   timeout=20, impersonate="chrome136").json()
+            messages = data.get("messages", [])
+            if not messages: break
+            last_dt  = parse_ts(messages[-1]["created_at"]).astimezone(EDT)
             if last_dt > WINDOW_END:
-                max_id=msgs[-1]["id"]; time.sleep(0.3); continue
-            for m in msgs:
-                edt = parse_ts(m["created_at"]).astimezone(EDT)
-                if edt > WINDOW_END: continue
-                if WINDOW_START <= edt <= WINDOW_END:
-                    out.append({
-                        "_ts": edt.replace(tzinfo=None).replace(second=0,microsecond=0),
-                        "sentiment": extract_sentiment(m),
+                max_id = messages[-1]["id"]; time.sleep(0.3); continue
+            for msg in messages:
+                msg_edt = parse_ts(msg["created_at"]).astimezone(EDT)
+                if msg_edt > WINDOW_END: continue
+                if WINDOW_START <= msg_edt <= WINDOW_END:
+                    collected.append({
+                        "_ts": msg_edt.replace(tzinfo=None).replace(second=0, microsecond=0),
+                        "sentiment": extract_sentiment(msg),
                     })
-                elif edt < WINDOW_START: stop=True; break
-            max_id=msgs[-1]["id"]
+                elif msg_edt < WINDOW_START:
+                    stop = True; break
+            max_id = messages[-1]["id"]
             time.sleep(0.5)
         except: break
-    return out
+    return collected
 
 def build_windows(collected, window_mins):
-    mc,mb,mr = defaultdict(int),defaultdict(int),defaultdict(int)
+    mc, mb, mr = defaultdict(int), defaultdict(int), defaultdict(int)
     for m in collected:
-        t=m["_ts"]; mc[t]+=1
-        if m["sentiment"]=="Bullish": mb[t]+=1
-        if m["sentiment"]=="Bearish": mr[t]+=1
-    rows,t=[],WINDOW_START.replace(tzinfo=None)
-    t_end=WINDOW_END.replace(tzinfo=None)
-    while t+timedelta(minutes=window_mins)<=t_end:
-        wend  = t+timedelta(minutes=window_mins)
-        keys  = [k for k in mc if t<=k<wend]
-        total = sum(mc[k] for k in keys)
-        bull  = sum(mb[k] for k in keys)
-        bear  = sum(mr[k] for k in keys)
-        tgd   = bull+bear
-        raw   = (bull-bear)/tgd if tgd>0 else 0.0
-        rows.append({"t":t,"total":total,"weighted":raw*np.log1p(total)})
-        t+=timedelta(minutes=1)
-    if not rows: return None
-    mx=max(abs(w["weighted"]) for w in rows) or 1.0
-    for w in rows: w["norm_score"]=w["weighted"]/mx
+        t = m["_ts"]
+        mc[t] += 1
+        if m["sentiment"] == "Bullish": mb[t] += 1
+        if m["sentiment"] == "Bearish": mr[t] += 1
+
+    windows, t = [], WINDOW_START.replace(tzinfo=None)
+    t_end = WINDOW_END.replace(tzinfo=None)
+    while t + timedelta(minutes=window_mins) <= t_end:
+        wend   = t + timedelta(minutes=window_mins)
+        keys   = [k for k in mc if t <= k < wend]
+        total  = sum(mc[k] for k in keys)
+        bull   = sum(mb[k] for k in keys)
+        bear   = sum(mr[k] for k in keys)
+        tagged = bull + bear
+        raw    = (bull - bear) / tagged if tagged > 0 else 0.0
+        windows.append({"t": t, "total": total,
+                        "weighted": raw * np.log1p(total)})
+        t += timedelta(minutes=1)
+
+    if not windows: return None
+    max_w = max(abs(w["weighted"]) for w in windows) or 1.0
+    for w in windows: w["norm_score"] = w["weighted"] / max_w
+
     return pd.DataFrame({
-        "minute":     pd.to_datetime([w["t"] for w in rows]),
-        "density":    [w["total"] for w in rows],
-        "norm_score": [w["norm_score"] for w in rows],
+        "minute":     pd.to_datetime([w["t"] for w in windows]),
+        "density":    [w["total"] for w in windows],
+        "norm_score": [w["norm_score"] for w in windows],
     })
 
-def merge_df(df_price, win_df):
-    dp = df_price.copy()
-    dp["minute"] = dp["date"].dt.floor("min")
-    df = pd.merge(dp[["date","minute","close"]], win_df, on="minute", how="inner")
+def merge_price_windows(df_price, win_df):
+    df_p = df_price.copy()
+    df_p["minute"] = df_p["date"].dt.floor("min")
+    df = pd.merge(df_p[["date","minute","close"]], win_df, on="minute", how="inner")
     return df.dropna(subset=["close"]).reset_index(drop=True)
 
-def avg_corr_for_window(df_price, collected, window_mins):
-    """Returns mean(r_pd, r_ps) for a given window size."""
+def slope(values):
+    """Simple direction/steepness of the last few points: positive = rising,
+    negative = falling, near zero = flat. This is just 'is it going up or
+    down right now', used to catch divergence early — before correlation
+    has time to react."""
+    arr = np.array(values, dtype=float)
+    if len(arr) < 2:
+        return 0.0
+    x = np.arange(len(arr))
+    m, _ = np.polyfit(x, arr, 1)
+    return float(m)
+
+# ════════════════════════════════════════════════════════════
+# ROLLING CORRELATION HISTORY
+# ════════════════════════════════════════════════════════════
+# Rolling correlation (lookback window) is computed minute-by-minute across
+# the full session for both price↔density and price↔sentiment-score.
+# This raw correlation history is the input to the trade simulation below —
+# it is NOT itself the entry/exit threshold. Entry/exit thresholds are
+# derived per-trade from this history, not from a fixed formula.
+LOOKBACK = 10
+
+def rolling_corr_series(df_price, collected, window_mins):
     win_df = build_windows(collected, window_mins)
-    if win_df is None: return 0.0
-    df = merge_df(df_price, win_df)
-    if len(df)<5 or df["density"].max()==0: return 0.0
-    r_pd = safe_r(smooth(df["density"].values,k=5), smooth(df["close"].values,k=5))
-    r_ps = safe_r(smooth(df["norm_score"].values,k=5), smooth(df["close"].values,k=5))
-    return (r_pd+r_ps)/2
+    if win_df is None: return None
+    df = merge_price_windows(df_price, win_df)
+    if len(df) < LOOKBACK + 5: return None
 
-def derive_corr_threshold(df_price, collected, window_mins):
-    """
-    Derives the correlation threshold at the optimal window by:
-      1. Computing rolling r_pd and r_ps at every bar (10-bar lookback)
-      2. Measuring how consistently each is positive and how message-dense
-         the window is
-      3. Returns (thresh_pd, thresh_ps) — take their mean for one number
-    """
-    win_df = build_windows(collected, window_mins)
-    if win_df is None: return 0.3, 0.3
-    df = merge_df(df_price, win_df)
-    if len(df)<12: return 0.3, 0.3
+    df["ps"] = smooth(df["norm_score"].values, k=5)
+    df["dn"] = smooth(df["density"].values,    k=5)
+    df["pr"] = smooth(df["close"].values,      k=5)
 
-    df["ps"] = smooth(df["norm_score"].values,k=5)
-    df["dn"] = smooth(df["density"].values,   k=5)
-    df["pr"] = smooth(df["close"].values,     k=5)
-
-    LB = 10
-    rpd_h, rps_h, msg_h = [], [], []
+    r_pd_h, r_ps_h = [], []
     for i in range(len(df)):
-        if i < LB:
-            rpd_h.append(0.0); rps_h.append(0.0)
+        if i < LOOKBACK:
+            r_pd_h.append(0.0); r_ps_h.append(0.0)
         else:
-            sl = df.iloc[i-LB:i]
-            rpd_h.append(safe_r(sl["dn"], sl["pr"]))
-            rps_h.append(safe_r(sl["ps"], sl["pr"]))
-        msg_h.append(df["density"].iloc[i])
-
-    def calc(r_series, msg_counts):
-        recent_r    = r_series[-LB:]
-        recent_msgs = msg_counts[-LB:]
-        consistency = sum(1 for r in recent_r if r>0) / len(recent_r)
-        avg_msgs    = np.mean(recent_msgs) if recent_msgs else 0
-        vol_bonus   = 0.1 * min(np.log1p(avg_msgs)/np.log1p(50), 1.0)
-        return round(0.3 + 0.1*consistency + vol_bonus, 4)
-
-    return calc(rpd_h, msg_h), calc(rps_h, msg_h)
+            sl = df.iloc[i-LOOKBACK:i]
+            r_pd_h.append(safe_r(sl["dn"], sl["pr"]))
+            r_ps_h.append(safe_r(sl["ps"], sl["pr"]))
+    return (df["minute"].tolist(), df["close"].tolist(),
+            r_pd_h, r_ps_h, df["dn"].tolist(), df["ps"].tolist())
 
 # ════════════════════════════════════════════════════════════
-# STEP 3 — PROCESS EACH TICKER
+# PER-TRADE ENTRY / EXIT SIMULATION
 # ════════════════════════════════════════════════════════════
-print("="*60)
-print("  Fetching data...")
-print("="*60)
+# ENTRY (simple version):
+#   Watch "togetherness" (rolling correlation between price and
+#   density/sentiment) for each ticker. The entry bar is NOT a fixed
+#   number like 0.3 — it's derived from THIS ticker's own correlation
+#   today:  entry_bar = mean + 0.5*std
+#   In plain terms: "today's normal togetherness level, plus a bit of
+#   cushion, so we only catch genuinely unusual moments." Entry fires
+#   the moment live correlation crosses UP through that bar. We record
+#   the exact value it crossed at as r_entry.
+#
+# EXIT — two triggers, whichever fires first:
+#   1) DIVERGENCE (fast, early-warning, checked FIRST):
+#      Correlation is backward-looking — by the time it visibly drops,
+#      the crowd may already be reacting. So before relying on
+#      correlation decay, we check: is price still rising while the
+#      density/sentiment trend has already gone flat or turned down?
+#      That disagreement is the earliest sign the move is running out
+#      of steam, and it shows up before correlation has time to catch
+#      up. If price slope > 0 and signal slope <= 0 (or has dropped
+#      from clearly positive to flat/negative), exit now.
+#   2) CORRELATION DECAY (slower, backup/confirmation):
+#      If divergence never cleanly triggers, fall back to: exit once
+#      correlation decays to DECAY_FRACTION * r_entry (default 50%).
+#      This is anchored to THIS trade's own entry strength, not a
+#      separate guessed constant.
+#
+# Both the 0.5 cushion (entry) and 0.5 decay fraction (exit) are
+# starting assumptions, not proven optimal numbers — backtest the
+# trade log this script produces to check if other values do better.
+DECAY_FRACTION  = 0.5
+SLOPE_LOOKBACK  = 3   # how many recent bars to check for divergence
 
-ticker_rows = []   # one row per ticker: best_window, thresh_pd, thresh_ps, avg_r
+def entry_bar_from_distribution(r_series, label="", ticker=""):
+    """Data-derived 'elevated' bar for this ticker/day: mean + 0.5*std
+    of its own rolling correlation history."""
+    arr = np.array(r_series, dtype=float)
+    if len(arr) == 0 or np.all(arr == 0):
+        return None
+    mean_r, std_r = float(np.mean(arr)), float(np.std(arr))
+    bar = mean_r + 0.5 * std_r
+    bar = round(min(max(bar, 0.05), 1.0), 4)
+    # Diagnostic — shows WHY the bar landed where it did, so you can
+    # tell a genuinely low/noisy correlation apart from a formula floor.
+    print(f"      [{label}] mean={mean_r:.4f} std={std_r:.4f} -> entry_bar={bar}")
+    return bar
+
+def simulate_trades(minutes, prices, r_series, signal_series, entry_bar):
+    """
+    Walk forward through the correlation history.
+    Entry: correlation crosses UP through entry_bar while flat.
+    Exit, whichever fires first:
+      1) divergence: price still rising but signal (density/sentiment)
+         has flattened or turned down over the last SLOPE_LOOKBACK bars
+      2) correlation decays to DECAY_FRACTION * r_entry
+    """
+    if entry_bar is None:
+        return []
+
+    trades = []
+    in_trade = False
+    r_entry = None
+    entry_idx = None
+
+    for i in range(1, len(r_series)):
+        r_prev, r_now = r_series[i-1], r_series[i]
+
+        if not in_trade:
+            if r_prev < entry_bar <= r_now:
+                in_trade  = True
+                r_entry   = r_now
+                entry_idx = i
+        else:
+            exit_reason = None
+
+            # --- Check 1: divergence (early warning) ---
+            if i >= SLOPE_LOOKBACK:
+                price_slope  = slope(prices[i-SLOPE_LOOKBACK:i+1])
+                signal_slope = slope(signal_series[i-SLOPE_LOOKBACK:i+1])
+                if price_slope > 0 and signal_slope <= 0:
+                    exit_reason = "divergence"
+
+            # --- Check 2: correlation decay (backup) ---
+            exit_level = max(r_entry * DECAY_FRACTION, 0.0)
+            if exit_reason is None and r_now <= exit_level:
+                exit_reason = "decay"
+
+            if exit_reason:
+                trades.append({
+                    "entry_time":  minutes[entry_idx],
+                    "exit_time":   minutes[i],
+                    "exit_reason": exit_reason,
+                    "r_entry":     round(r_entry, 4),
+                    "r_exit":      round(r_now, 4),
+                    "decay_level": round(exit_level, 4),
+                    "price_entry": prices[entry_idx],
+                    "price_exit":  prices[i],
+                    "pct_move":    round((prices[i] - prices[entry_idx]) / prices[entry_idx] * 100, 4)
+                                   if prices[entry_idx] else 0.0,
+                    "bars_held":   i - entry_idx,
+                })
+                in_trade = False
+                r_entry  = None
+                entry_idx = None
+
+    # If still in a trade at the end of the window, log it as still-open
+    if in_trade:
+        trades.append({
+            "entry_time":  minutes[entry_idx],
+            "exit_time":   None,
+            "exit_reason": "still_open",
+            "r_entry":     round(r_entry, 4),
+            "r_exit":      round(r_series[-1], 4),
+            "decay_level": round(max(r_entry * DECAY_FRACTION, 0.0), 4),
+            "price_entry": prices[entry_idx],
+            "price_exit":  prices[-1],
+            "pct_move":    round((prices[-1] - prices[entry_idx]) / prices[entry_idx] * 100, 4)
+                           if prices[entry_idx] else 0.0,
+            "bars_held":   len(r_series) - 1 - entry_idx,
+        })
+
+    return trades
+
+# ════════════════════════════════════════════════════════════
+# PROCESS EACH TICKER
+# ════════════════════════════════════════════════════════════
+ticker_summary = []
+all_trades     = []
 
 for ticker in TICKERS:
-    print(f"  {ticker}...", end=" ", flush=True)
+    print(f"  {ticker}...", end=" ")
 
     df_price = fetch_price(ticker)
-    if df_price is None: print("no price"); continue
+    if df_price is None:
+        print("no price"); continue
 
     msgs = fetch_messages(ticker)
-    if not msgs: print("no messages"); continue
+    if len(msgs) == 0:
+        print("no messages"); continue
 
-    # ── Search every window size, find the one with max avg correlation ──
-    best_w, best_r = WIN_MIN, -999.0
-    window_scores  = {}
+    corr_data = rolling_corr_series(df_price.copy(), msgs, WINDOW_MIN)
+    if corr_data is None:
+        print("not enough data"); continue
 
-    for w in range(WIN_MIN, WIN_MAX+1, WIN_STEP):
-        r = avg_corr_for_window(df_price.copy(), msgs, w)
-        window_scores[w] = r
-        if r > best_r:
-            best_r, best_w = r, w
+    minutes, prices, r_pd_h, r_ps_h, density_smooth, sentiment_smooth = corr_data
 
-    # ── Derive correlation threshold at the optimal window ──
-    t_pd, t_ps = derive_corr_threshold(df_price.copy(), msgs, best_w)
+    print(f"   {ticker}:")
+    entry_bar_pd = entry_bar_from_distribution(r_pd_h, label="density",   ticker=ticker)
+    entry_bar_ps = entry_bar_from_distribution(r_ps_h, label="sentiment", ticker=ticker)
 
-    print(f"best_window={best_w}m  avg_r={best_r:+.4f}  "
-          f"thresh_pd={t_pd:.4f}  thresh_ps={t_ps:.4f}")
+    trades_pd = simulate_trades(minutes, prices, r_pd_h, density_smooth,   entry_bar_pd)
+    trades_ps = simulate_trades(minutes, prices, r_ps_h, sentiment_smooth, entry_bar_ps)
 
-    ticker_rows.append({
-        "ticker":       ticker,
-        "best_window":  best_w,
-        "best_avg_r":   round(best_r, 4),
-        "thresh_pd":    t_pd,
-        "thresh_ps":    t_ps,
-        "avg_thresh":   round((t_pd+t_ps)/2, 4),
-        "n_messages":   len(msgs),
+    for tr in trades_pd:
+        tr.update({"ticker": ticker, "signal": "density"})
+        all_trades.append(tr)
+    for tr in trades_ps:
+        tr.update({"ticker": ticker, "signal": "sentiment"})
+        all_trades.append(tr)
+
+    n_trades = len(trades_pd) + len(trades_ps)
+    print(f"entry_bar_pd={entry_bar_pd} entry_bar_ps={entry_bar_ps} trades={n_trades}")
+
+    ticker_summary.append({
+        "ticker":        ticker,
+        "window_mins":   WINDOW_MIN,
+        "entry_bar_density":   entry_bar_pd,
+        "entry_bar_sentiment": entry_bar_ps,
+        "decay_fraction":      DECAY_FRACTION,
+        "n_trades_density":    len(trades_pd),
+        "n_trades_sentiment":  len(trades_ps),
     })
 
 # ════════════════════════════════════════════════════════════
-# STEP 4 — AGGREGATE & OUTPUT
+# OUTPUT
 # ════════════════════════════════════════════════════════════
-if not ticker_rows:
-    day_name = datetime(*date_parts).strftime("%A")
-    print(f"\n⚠️  No usable data returned.")
-    print(f"   {DATE_STR} is a {day_name} — confirm it is a trading day.")
-    print(f"   Also check that the token is valid and tickers have StockTwits activity.")
+if not ticker_summary:
+    print("\n⚠️  No results — all tickers had no price data or no messages for this date.")
+    print(f"    Try: {DATE_STR} is a {datetime(*date_parts).strftime('%A')} — check it's a trading day.")
 else:
-    df_r = pd.DataFrame(ticker_rows)
+    df_summary = pd.DataFrame(ticker_summary)
+    df_trades  = pd.DataFrame(all_trades)
 
-    # ── Optimal window: weighted mean by avg_r so high-correlation
-    #    tickers have more influence; then round to nearest WIN_STEP ──
-    weights    = np.clip(df_r["best_avg_r"].values, 0, None)
-    w_sum      = weights.sum()
-    if w_sum > 0:
-        weighted_win = float(np.average(df_r["best_window"].values, weights=weights))
+    print(f"\n{'='*60}")
+    print(f"  DATE       : {DATE_STR}")
+    print(f"  WINDOW     : {WINDOW_MIN} minutes")
+    print(f"  EXIT RULES : divergence (price up, signal flat/down) FIRST,")
+    print(f"               then decay to {DECAY_FRACTION}*r_entry as backup")
+    print(f"{'='*60}")
+    print(f"\nPer-ticker summary ({len(df_summary)} tickers):")
+    print(df_summary.to_string(index=False))
+
+    if len(df_trades) > 0:
+        print(f"\nTotal simulated trades: {len(df_trades)}")
+        print(f"Mean pct_move per trade: {df_trades['pct_move'].mean():.4f}%")
+        print(f"\nSample trades:")
+        print(df_trades.head(10).to_string(index=False))
     else:
-        weighted_win = float(df_r["best_window"].mean())
+        print("\nNo trades triggered (correlation never crossed an entry bar).")
 
-    OPT_WINDOW = int(round(weighted_win / WIN_STEP) * WIN_STEP)
-    OPT_WINDOW = max(WIN_MIN, min(WIN_MAX, OPT_WINDOW))   # clamp to valid range
-
-    # ── Optimal threshold: median of per-ticker avg_thresh values ──
-    # Median is more robust than mean — one outlier ticker won't skew it
-    OPT_THRESH = round(float(df_r["avg_thresh"].median()), 4)
-
-    # ── Per-ticker breakdown table ────────────────────────────
-    print(f"\n{'═'*65}")
-    print(f"  {MARKET_CAP.upper()} | {DATE_STR} | {START_TIME}–{END_TIME}")
-    print(f"{'═'*65}")
-    print(f"\n  Per-ticker breakdown ({len(df_r)} tickers):\n")
-    pd.set_option("display.float_format", lambda x: f"{x:.4f}")
-    print(df_r[["ticker","best_window","best_avg_r",
-                "thresh_pd","thresh_ps","avg_thresh","n_messages"]
-              ].to_string(index=False))
-
-    # ── Distribution summary ──────────────────────────────────
-    print(f"\n  Window distribution:")
-    print(f"    min={df_r['best_window'].min()}  "
-          f"median={df_r['best_window'].median():.0f}  "
-          f"mean={df_r['best_window'].mean():.1f}  "
-          f"max={df_r['best_window'].max()}")
-    print(f"  Threshold distribution:")
-    print(f"    min={df_r['avg_thresh'].min():.4f}  "
-          f"median={df_r['avg_thresh'].median():.4f}  "
-          f"mean={df_r['avg_thresh'].mean():.4f}  "
-          f"max={df_r['avg_thresh'].max():.4f}")
-
-    # ── THE ANSWER ────────────────────────────────────────────
-    print(f"\n{'═'*65}")
-    print(f"  ✅  OPTIMAL ROLLING WINDOW   :  {OPT_WINDOW} minutes")
-    print(f"  ✅  OPTIMAL CORR THRESHOLD   :  {OPT_THRESH}")
-    print(f"{'═'*65}\n")
-
-    # ── Save CSV ──────────────────────────────────────────────
-    out = f"{MARKET_CAP}_{DATE_STR}_{START_TIME.replace(':','')}_{END_TIME.replace(':','')}_window_thresh.csv"
-    df_r.to_csv(out, index=False)
-    files.download(out)
-    print(f"  CSV → {out}")
+    out_summary = f"entry_exit_summary_{DATE_STR}.csv"
+    out_trades  = f"entry_exit_trades_{DATE_STR}.csv"
+    df_summary.to_csv(out_summary, index=False)
+    df_trades.to_csv(out_trades, index=False)
+    files.download(out_summary)
+    files.download(out_trades)
+    print(f"\nCSVs saved → {out_summary}, {out_trades}")
