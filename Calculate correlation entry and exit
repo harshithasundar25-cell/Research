@@ -1,0 +1,285 @@
+!pip install curl_cffi -q
+import time, io, requests
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from curl_cffi import requests as cffi_requests
+from collections import defaultdict
+from scipy import stats
+from google.colab import files
+
+# ════════════════════════════════════════════════════════════
+# CONFIG
+# ════════════════════════════════════════════════════════════
+AUTH_TOKEN = "9faf63f5-c9b6-4386-b2c0-856d6a96877a"
+EDT        = ZoneInfo("America/New_York")
+
+START_TIME = "04:00"
+END_TIME   = "20:00"
+
+# ── User inputs ────────────────────────────────────────────
+print("Upload a CSV file containing your tickers (any column named 'ticker'/'symbol', or first column).")
+uploaded = files.upload()
+csv_name = next(iter(uploaded))
+df_tickers = pd.read_csv(io.BytesIO(uploaded[csv_name]))
+
+ticker_col = next(
+    (c for c in df_tickers.columns if c.strip().lower() in ("ticker", "tickers", "symbol", "symbols")),
+    df_tickers.columns[0]
+)
+TICKERS = (
+    df_tickers[ticker_col]
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .str.upper()
+    .unique()
+    .tolist()
+)
+
+DATE_STR    = input("Date (YYYY-MM-DD): ").strip()
+WINDOW_MIN  = 15  # fixed rolling window size in minutes (no longer user-input)
+
+date_parts   = [int(x) for x in DATE_STR.split("-")]
+WINDOW_START = datetime(date_parts[0], date_parts[1], date_parts[2], 4,  0, 0, tzinfo=EDT)
+WINDOW_END   = datetime(date_parts[0], date_parts[1], date_parts[2], 20, 0, 0, tzinfo=EDT)
+
+print(f"\n✅ {len(TICKERS)} tickers | {DATE_STR} | window = {WINDOW_MIN} mins\n")
+
+# ════════════════════════════════════════════════════════════
+# HELPERS
+# ════════════════════════════════════════════════════════════
+def parse_ts(ts_str):
+    return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+def extract_sentiment(msg):
+    raw = msg.get("entities", {}).get("sentiment", None)
+    return raw.get("basic", "None") if raw else "None"
+
+def safe_r(a, b):
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    if len(a) < 5 or a.std() == 0 or b.std() == 0: return 0.0
+    r, _ = stats.pearsonr(a, b)
+    return round(float(r), 4)
+
+def smooth(arr, k=5):
+    arr = list(arr)
+    if len(arr) < k: return arr
+    return np.convolve(arr, np.ones(k)/k, mode='same').tolist()
+
+def fetch_price(ticker):
+    url = f"https://elite.finviz.com/quote_export?t={ticker}&p=i1&auth={AUTH_TOKEN}"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if resp.status_code != 200: return None
+        df = pd.read_csv(io.StringIO(resp.text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        dt_col = next((c for c in df.columns if "date" in c or "time" in c), None)
+        if dt_col is None: return None
+
+        df["date"] = pd.to_datetime(df[dt_col].astype(str),
+                                    format="%m/%d/%Y %I:%M %p", errors="coerce")
+        if df["date"].isna().all():
+            df["date"] = pd.to_datetime(df[dt_col].astype(str),
+                                        format="%m/%d/%Y %H:%M", errors="coerce")
+        df = df.dropna(subset=["date"])
+        if len(df) == 0: return None
+
+        start_dt = pd.Timestamp(f"{DATE_STR} {START_TIME}:00")
+        end_dt   = pd.Timestamp(f"{DATE_STR} {END_TIME}:00")
+        df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)].copy()
+        df = df[["date","close"]].sort_values("date").reset_index(drop=True)
+        return df if len(df) >= 5 else None
+    except:
+        return None
+
+def fetch_messages(ticker):
+    api_url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
+    headers = {"Accept": "application/json",
+               "Referer": f"https://stocktwits.com/symbol/{ticker}",
+               "Origin": "https://stocktwits.com"}
+    session, collected, max_id, stop, page = cffi_requests.Session(), [], None, False, 0
+    while not stop and page < 50:
+        page += 1
+        try:
+            params = {"limit": 30}
+            if max_id: params["max"] = max_id
+            data     = session.get(api_url, headers=headers, params=params,
+                                   timeout=20, impersonate="chrome136").json()
+            messages = data.get("messages", [])
+            if not messages: break
+            last_dt  = parse_ts(messages[-1]["created_at"]).astimezone(EDT)
+            if last_dt > WINDOW_END:
+                max_id = messages[-1]["id"]; time.sleep(0.3); continue
+            for msg in messages:
+                msg_edt = parse_ts(msg["created_at"]).astimezone(EDT)
+                if msg_edt > WINDOW_END: continue
+                if WINDOW_START <= msg_edt <= WINDOW_END:
+                    collected.append({
+                        "_ts": msg_edt.replace(tzinfo=None).replace(second=0, microsecond=0),
+                        "sentiment": extract_sentiment(msg),
+                    })
+                elif msg_edt < WINDOW_START:
+                    stop = True; break
+            max_id = messages[-1]["id"]
+            time.sleep(0.5)
+        except: break
+    return collected
+
+def build_windows(collected, window_mins):
+    mc, mb, mr = defaultdict(int), defaultdict(int), defaultdict(int)
+    for m in collected:
+        t = m["_ts"]
+        mc[t] += 1
+        if m["sentiment"] == "Bullish": mb[t] += 1
+        if m["sentiment"] == "Bearish": mr[t] += 1
+
+    windows, t = [], WINDOW_START.replace(tzinfo=None)
+    t_end = WINDOW_END.replace(tzinfo=None)
+    while t + timedelta(minutes=window_mins) <= t_end:
+        wend   = t + timedelta(minutes=window_mins)
+        keys   = [k for k in mc if t <= k < wend]
+        total  = sum(mc[k] for k in keys)
+        bull   = sum(mb[k] for k in keys)
+        bear   = sum(mr[k] for k in keys)
+        tagged = bull + bear
+        raw    = (bull - bear) / tagged if tagged > 0 else 0.0
+        windows.append({"t": t, "total": total,
+                        "weighted": raw * np.log1p(total)})
+        t += timedelta(minutes=1)
+
+    if not windows: return None
+    max_w = max(abs(w["weighted"]) for w in windows) or 1.0
+    for w in windows: w["norm_score"] = w["weighted"] / max_w
+
+    return pd.DataFrame({
+        "minute":     pd.to_datetime([w["t"] for w in windows]),
+        "density":    [w["total"] for w in windows],
+        "norm_score": [w["norm_score"] for w in windows],
+    })
+
+def merge_price_windows(df_price, win_df):
+    df_p = df_price.copy()
+    df_p["minute"] = df_p["date"].dt.floor("min")
+    df = pd.merge(df_p[["date","minute","close"]], win_df, on="minute", how="inner")
+    return df.dropna(subset=["close"]).reset_index(drop=True)
+
+# ════════════════════════════════════════════════════════════
+# ENTRY / EXIT THRESHOLD CALCULATION
+# ════════════════════════════════════════════════════════════
+# Rolling correlation (lookback window) is computed minute-by-minute across
+# the full session for both price↔density and price↔sentiment-score.
+# From the resulting correlation history we derive:
+#   - ENTRY threshold: a high bar the correlation must clear to "turn on"
+#     (mean + 0.5*std of the positive-correlation regime)
+#   - EXIT  threshold: a lower bar — once correlation falls below this,
+#     the signal is considered broken (mean - 0.5*std, floored at 0)
+LOOKBACK = 10
+
+def rolling_corr_series(df_price, collected, window_mins):
+    win_df = build_windows(collected, window_mins)
+    if win_df is None: return None
+    df = merge_price_windows(df_price, win_df)
+    if len(df) < LOOKBACK + 5: return None
+
+    df["ps"] = smooth(df["norm_score"].values, k=5)
+    df["dn"] = smooth(df["density"].values,    k=5)
+    df["pr"] = smooth(df["close"].values,      k=5)
+
+    r_pd_h, r_ps_h = [], []
+    for i in range(len(df)):
+        if i < LOOKBACK:
+            r_pd_h.append(0.0); r_ps_h.append(0.0)
+        else:
+            sl = df.iloc[i-LOOKBACK:i]
+            r_pd_h.append(safe_r(sl["dn"], sl["pr"]))
+            r_ps_h.append(safe_r(sl["ps"], sl["pr"]))
+    return r_pd_h, r_ps_h
+
+def entry_exit_thresholds(r_series):
+    """Given a correlation history, return (entry_thresh, exit_thresh)."""
+    if not r_series:
+        return 0.3, 0.15
+    arr = np.array(r_series, dtype=float)
+    if np.all(arr == 0):
+        return 0.3, 0.15
+
+    mean_r = float(np.mean(arr))
+    std_r  = float(np.std(arr))
+
+    entry = mean_r + 0.5 * std_r
+    exit_ = mean_r - 0.5 * std_r
+
+    # Keep sensible bounds: entry should be a meaningfully positive bar,
+    # exit should always be lower than entry and not negative.
+    entry = round(max(min(entry, 1.0), 0.05), 4)
+    exit_ = round(max(min(exit_, entry - 0.01), 0.0), 4)
+
+    return entry, exit_
+
+# ════════════════════════════════════════════════════════════
+# PROCESS EACH TICKER
+# ════════════════════════════════════════════════════════════
+ticker_results = []
+
+for ticker in TICKERS:
+    print(f"  {ticker}...", end=" ")
+
+    df_price = fetch_price(ticker)
+    if df_price is None:
+        print("no price"); continue
+
+    msgs = fetch_messages(ticker)
+    if len(msgs) == 0:
+        print("no messages"); continue
+
+    corr_series = rolling_corr_series(df_price.copy(), msgs, WINDOW_MIN)
+    if corr_series is None:
+        print("not enough data"); continue
+
+    r_pd_h, r_ps_h = corr_series
+
+    entry_pd, exit_pd = entry_exit_thresholds(r_pd_h)
+    entry_ps, exit_ps = entry_exit_thresholds(r_ps_h)
+
+    entry_avg = round((entry_pd + entry_ps) / 2, 4)
+    exit_avg  = round((exit_pd  + exit_ps)  / 2, 4)
+
+    print(f"entry={entry_avg} exit={exit_avg}")
+    ticker_results.append({
+        "ticker": ticker,
+        "window_mins": WINDOW_MIN,
+        "entry_thresh_density": entry_pd,
+        "exit_thresh_density":  exit_pd,
+        "entry_thresh_sentiment": entry_ps,
+        "exit_thresh_sentiment":  exit_ps,
+        "entry_threshold_avg": entry_avg,
+        "exit_threshold_avg":  exit_avg,
+    })
+
+# ════════════════════════════════════════════════════════════
+# OUTPUT
+# ════════════════════════════════════════════════════════════
+if not ticker_results:
+    print("\n⚠️  No results — all tickers had no price data or no messages for this date.")
+    print(f"    Try: {DATE_STR} is a {datetime(*date_parts).strftime('%A')} — check it's a trading day.")
+else:
+    df_r = pd.DataFrame(ticker_results)
+    opt_entry = round(df_r["entry_threshold_avg"].mean(), 4)
+    opt_exit  = round(df_r["exit_threshold_avg"].mean(), 4)
+
+    print(f"\n{'='*50}")
+    print(f"  DATE       : {DATE_STR}")
+    print(f"  WINDOW     : {WINDOW_MIN} minutes")
+    print(f"{'='*50}")
+    print(f"\n  ✅ AVG ENTRY THRESHOLD : {opt_entry}")
+    print(f"  ✅ AVG EXIT  THRESHOLD : {opt_exit}")
+    print(f"\n{'='*50}")
+    print(f"\nBreakdown ({len(df_r)} tickers):")
+    print(df_r.to_string(index=False))
+
+    out = f"entry_exit_thresholds_{DATE_STR}.csv"
+    df_r.to_csv(out, index=False)
+    files.download(out)
+    print(f"\nCSV saved → {out}")
