@@ -1,0 +1,492 @@
+"""
+Parameter Optimizer — Profit vs Threshold / Rolling Window / Stop Loss
+=======================================================================
+For each market cap, finds ticker CSVs in Downloads, fetches price +
+sentiment data once, sweeps the chosen parameter, and saves one profit
+chart per market cap.
+
+Requirements:
+    pip install curl_cffi pandas scipy pytz matplotlib
+"""
+
+import os
+import re
+import sys
+import time
+import math
+import warnings
+from datetime import datetime
+from io import StringIO
+
+import pandas as pd
+import pytz
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from curl_cffi import requests as curl_requests
+from scipy.stats import pearsonr
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+AUTH_TOKEN    = "9ab7f858-0150-4a8f-a82c-8755d999d830"
+DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+EST           = pytz.timezone("America/New_York")
+
+PCT_CHANGE_THRESHOLDS = {
+    "nano":  10.0,
+    "micro": 10.0,
+    "small":  5.0,
+    "mid":    5.0,
+    "large":  0.5,
+    "mega":   0.5,
+}
+
+ALL_CAPS = ["nano", "micro", "small", "mid", "large", "mega"]
+
+# Fixed values when not being swept
+FIXED_THRESHOLD   = 0.3
+FIXED_WINDOW_MIN  = 360
+FIXED_STOP_PCT    = 30.0
+
+# Sweep ranges
+THRESHOLD_VALUES  = [round(x * 0.1, 1) for x in range(1, 11)]   # 0.1 .. 1.0
+WINDOW_VALUES     = list(range(10, 970, 10))                       # 10 .. 960
+STOP_VALUES       = [5, 10, 15, 20, 25, 30]
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+def curl_get(url, params=None, timeout=30):
+    return curl_requests.get(
+        url, params=params, timeout=timeout,
+        impersonate="chrome110",
+        headers={"User-Agent": "Mozilla/5.0"},
+        allow_redirects=True,
+    )
+
+# ---------------------------------------------------------------------------
+# PRICE DATA
+# ---------------------------------------------------------------------------
+
+def get_price_data(ticker, date):
+    url = (
+        "https://elite.finviz.com/quote_export?"
+        "t=" + ticker + "&p=i1&s=" + date + "&e=" + date + "&auth=" + AUTH_TOKEN
+    )
+    try:
+        resp = curl_get(url, timeout=30)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        df = pd.read_csv(StringIO(resp.text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        dt_col = next((c for c in df.columns if "date" in c or "time" in c), None)
+        if dt_col is None:
+            return pd.DataFrame()
+        df[dt_col] = df[dt_col].astype(str).str.replace(r"\s+(AM|PM)$", "", regex=True)
+        df[dt_col] = pd.to_datetime(df[dt_col], format="%m/%d/%Y %H:%M", errors="coerce")
+        df = df.dropna(subset=[dt_col]).rename(columns={dt_col: "datetime"})
+        if df["datetime"].dt.tz is None:
+            df["datetime"] = df["datetime"].dt.tz_localize(EST)
+        return df[["datetime", "close"]].sort_values("datetime").reset_index(drop=True)
+    except Exception as e:
+        return pd.DataFrame()
+
+# ---------------------------------------------------------------------------
+# STOCKTWITS SENTIMENT
+# ---------------------------------------------------------------------------
+
+def fetch_stocktwits_messages(ticker, date):
+    base = "https://api.stocktwits.com/api/2/streams/symbol/" + ticker + ".json"
+    date_dt   = datetime.strptime(date, "%Y-%m-%d")
+    day_start = EST.localize(date_dt.replace(hour=0,  minute=0,  second=0))
+    day_end   = EST.localize(date_dt.replace(hour=23, minute=59, second=59))
+    rows, max_id, stop, page = [], None, False, 0
+    while not stop and page < 40:
+        params = {"limit": 30}
+        if max_id:
+            params["max"] = max_id
+        try:
+            resp = curl_get(base, params=params, timeout=20)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+        except Exception:
+            break
+        messages = data.get("messages", [])
+        if not messages:
+            break
+        for msg in messages:
+            raw_ts = msg.get("created_at", "")
+            try:
+                ts_utc = datetime.strptime(raw_ts, "%Y-%m-%dT%H:%M:%SZ")
+                ts_utc = pytz.utc.localize(ts_utc)
+                ts_est = ts_utc.astimezone(EST)
+            except Exception:
+                continue
+            if ts_est < day_start:
+                stop = True
+                break
+            if ts_est > day_end:
+                continue
+            sentiment = (msg.get("entities") or {}).get("sentiment") or {}
+            label  = (sentiment.get("basic") or "").lower()
+            bull   = 1 if label == "bullish" else 0
+            bear   = 1 if label == "bearish" else 0
+            tagged = 1 if label in ("bullish", "bearish") else 0
+            rows.append({"datetime": ts_est, "bull": bull, "bear": bear,
+                         "tagged": tagged, "total": 1})
+        max_id = messages[-1].get("id")
+        page  += 1
+        time.sleep(0.3)
+    if not rows:
+        return pd.DataFrame(columns=["datetime", "bull", "bear", "tagged", "total"])
+    return pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
+
+# ---------------------------------------------------------------------------
+# ROLLING WINDOW HELPERS
+# ---------------------------------------------------------------------------
+
+def hhmm_to_minutes(hhmm):
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+def build_rolling_windows(window_minutes, date):
+    base      = datetime.strptime(date, "%Y-%m-%d")
+    start_min = hhmm_to_minutes("04:00")
+    end_min   = hhmm_to_minutes("20:00")
+    windows   = []
+    cur       = start_min
+    while cur + window_minutes <= end_min + 1:
+        ws = EST.localize(base.replace(hour=cur // 60, minute=cur % 60, second=0))
+        we = EST.localize(base.replace(
+            hour=(cur + window_minutes) // 60,
+            minute=(cur + window_minutes) % 60, second=0))
+        windows.append((ws, we))
+        cur += 1
+    return windows
+
+def safe_corr(x, y):
+    pairs = [(a, b) for a, b in zip(x, y)
+             if not math.isnan(a) and not math.isnan(b)]
+    if len(pairs) < 3:
+        return float("nan")
+    xs, ys = zip(*pairs)
+    try:
+        r, _ = pearsonr(xs, ys)
+        return r
+    except Exception:
+        return float("nan")
+
+def calc_sentiment_score(bull, bear, tagged, total, max_weight=1.0):
+    if tagged == 0 or max_weight == 0:
+        return float("nan")
+    return ((bull - bear) / tagged * math.log(1 + total)) / max_weight
+
+# ---------------------------------------------------------------------------
+# CORE: compute total profit for one ticker given window + params
+# ---------------------------------------------------------------------------
+
+def compute_profit_for_ticker(price_df, msg_df, window_minutes,
+                               entry_corr, trailing_stop_pct, pct_threshold):
+    if price_df.empty:
+        return 0.0
+
+    total_msgs = int(msg_df["total"].sum()) if not msg_df.empty else 0
+    if total_msgs == 0:
+        return 0.0
+
+    windows_meta = build_rolling_windows(window_minutes, price_df["datetime"].iloc[0].strftime("%Y-%m-%d"))
+
+    all_msg_windows = []
+    for ws, we in windows_meta:
+        m   = msg_df[(msg_df["datetime"] >= ws) & (msg_df["datetime"] < we)]
+        b   = int(m["bull"].sum())   if not m.empty else 0
+        br  = int(m["bear"].sum())   if not m.empty else 0
+        t   = int(m["tagged"].sum()) if not m.empty else 0
+        tot = int(m["total"].sum())  if not m.empty else 0
+        all_msg_windows.append((b, br, t, tot))
+
+    max_weight = max(
+        (abs((b - br) / t * math.log(1 + tot))
+         for b, br, t, tot in all_msg_windows if t > 0),
+        default=1.0,
+    )
+
+    window_data = []
+    for (ws, we), (b, br, t, tot) in zip(windows_meta, all_msg_windows):
+        p  = price_df[(price_df["datetime"] >= ws) & (price_df["datetime"] < we)]
+        po = p["close"].iloc[0]  if len(p) >= 1 else float("nan")
+        pc = p["close"].iloc[-1] if len(p) >= 1 else float("nan")
+        mpm   = tot / window_minutes
+        score = calc_sentiment_score(b, br, t, tot, max_weight)
+        window_data.append({
+            "price_open":  po,
+            "price_close": pc,
+            "msg_per_min": mpm,
+            "sentiment":   score,
+        })
+
+    prices     = [w["price_close"] for w in window_data]
+    densities  = [w["msg_per_min"] for w in window_data]
+    sentiments = [w["sentiment"]   for w in window_data]
+
+    corr_pd, corr_ps = [], []
+    for i in range(len(window_data)):
+        lo = max(0, i - 9)
+        corr_pd.append(safe_corr(prices[lo:i+1], densities[lo:i+1]))
+        corr_ps.append(safe_corr(prices[lo:i+1], sentiments[lo:i+1]))
+
+    total_profit = 0.0
+    in_trade     = False
+    entry_idx    = None
+    peak_pd      = None
+    peak_ps      = None
+
+    for i, w in enumerate(window_data):
+        price_rising = (
+            not math.isnan(w["price_open"]) and not math.isnan(w["price_close"])
+            and w["price_close"] > w["price_open"]
+        )
+        r_pd = corr_pd[i]
+        r_ps = corr_ps[i]
+
+        entry_corr_ok = (
+            not math.isnan(r_pd) and not math.isnan(r_ps)
+            and r_pd >= entry_corr and r_ps >= entry_corr
+        )
+
+        trailing_stop_hit = False
+        if in_trade and trailing_stop_pct is not None:
+            if not math.isnan(r_pd) and peak_pd is not None:
+                peak_pd = max(peak_pd, r_pd)
+            if not math.isnan(r_ps) and peak_ps is not None:
+                peak_ps = max(peak_ps, r_ps)
+            frac = trailing_stop_pct / 100.0
+            pd_stopped = (peak_pd is not None and not math.isnan(r_pd)
+                          and r_pd < peak_pd * (1 - frac))
+            ps_stopped = (peak_ps is not None and not math.isnan(r_ps)
+                          and r_ps < peak_ps * (1 - frac))
+            trailing_stop_hit = pd_stopped or ps_stopped
+
+        if not in_trade:
+            if price_rising and entry_corr_ok:
+                in_trade  = True
+                entry_idx = i
+                peak_pd   = r_pd if not math.isnan(r_pd) else None
+                peak_ps   = r_ps if not math.isnan(r_ps) else None
+        else:
+            exit_now = (not price_rising) or trailing_stop_hit
+            if exit_now or i == len(window_data) - 1:
+                if i != entry_idx:
+                    ep = window_data[entry_idx]["price_open"]
+                    xp = window_data[i]["price_close"]
+                    if ep and ep != 0 and not math.isnan(ep) and not math.isnan(xp):
+                        pct = (xp - ep) / ep * 100
+                        if pct > pct_threshold:
+                            total_profit += ep * pct / 100
+                in_trade  = False
+                entry_idx = None
+                peak_pd   = None
+                peak_ps   = None
+
+    return total_profit
+
+
+# ---------------------------------------------------------------------------
+# FIND TICKER CSVs FOR A MARKET CAP
+# ---------------------------------------------------------------------------
+
+def find_ticker_csv(market_cap):
+    """
+    Look for a Finviz screener export CSV in Downloads that has a Ticker column
+    and matches this market cap name in the filename (e.g. nano_first_2026-06-15.csv).
+    Returns list of tickers or empty list.
+    """
+    for f in sorted(os.listdir(DOWNLOADS_DIR), reverse=True):
+        if market_cap.lower() not in f.lower():
+            continue
+        if not f.endswith(".csv"):
+            continue
+        path = os.path.join(DOWNLOADS_DIR, f)
+        try:
+            df = pd.read_csv(path)
+            col_map = {c.strip().lower(): c for c in df.columns}
+            if "ticker" not in col_map:
+                continue
+            tickers = df[col_map["ticker"]].dropna().astype(str).str.strip().tolist()
+            if tickers:
+                print("  [" + market_cap + "] Using ticker file: " + f +
+                      " (" + str(len(tickers)) + " tickers)")
+                return tickers
+        except Exception:
+            continue
+    return []
+
+
+# ---------------------------------------------------------------------------
+# PLOT ONE CHART
+# ---------------------------------------------------------------------------
+
+def plot_and_save(x_values, profits, x_label, title, out_path, x_fmt=None):
+    fig, ax = plt.subplots(figsize=(13, 6))
+    color = "#2196F3"
+    ax.plot(x_values, profits, color=color, linewidth=2.5,
+            marker="o", markersize=5, label="Total Profit ($)")
+    ax.fill_between(x_values, profits, alpha=0.08, color=color)
+    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax.set_xlabel(x_label, fontsize=12)
+    ax.set_ylabel("Total Profit ($)", fontsize=12, color=color)
+    ax.tick_params(axis="y", labelcolor=color)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: "${:,.0f}".format(v)))
+
+    if profits:
+        best_idx    = profits.index(max(profits))
+        best_x      = x_values[best_idx]
+        best_profit = profits[best_idx]
+        label_x = str(best_x) + (x_fmt or "")
+        ax.annotate(
+            "Best: " + label_x + "\n$" + "{:,.2f}".format(best_profit),
+            xy=(best_x, best_profit),
+            xytext=(best_x, best_profit * 0.80),
+            arrowprops=dict(arrowstyle="->", color="black"),
+            fontsize=10, color="black",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.9),
+        )
+
+    ax.set_xticks(x_values)
+    ax.set_xticklabels([str(x) + (x_fmt or "") for x in x_values],
+                       rotation=45, ha="right", fontsize=8)
+    plt.title(title, fontsize=13, fontweight="bold", pad=12)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: " + os.path.basename(out_path))
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+def main():
+    print("\n" + "=" * 60)
+    print("  Parameter Optimizer")
+    print("=" * 60)
+
+    opt_mode = ""
+    while opt_mode not in ("threshold", "rolling window", "stop loss"):
+        opt_mode = input(
+            "\nWhat are you optimizing? (threshold / rolling window / stop loss): "
+        ).strip().lower()
+
+    date = input("Date (YYYY-MM-DD): ").strip()
+
+    print("\n[Setup] Looking for ticker files and fetching data for all market caps...")
+
+    for market_cap in ALL_CAPS:
+        print("\n" + "─" * 50)
+        print("Market cap: " + market_cap.upper())
+
+        tickers = find_ticker_csv(market_cap)
+        if not tickers:
+            print("  No ticker CSV found for " + market_cap + " — skipping.")
+            continue
+
+        pct_threshold = PCT_CHANGE_THRESHOLDS[market_cap]
+
+        # Fetch price + sentiment once per ticker
+        print("  Fetching price & sentiment data...")
+        price_cache = {}
+        msg_cache   = {}
+        for ticker in tickers:
+            pdf = get_price_data(ticker, date)
+            mdf = fetch_stocktwits_messages(ticker, date)
+            msgs_count = int(mdf["total"].sum()) if not mdf.empty else 0
+            price_rows = len(pdf)
+            print("    " + ticker + " -> price_rows=" + str(price_rows) + "  messages=" + str(msgs_count))
+            price_cache[ticker] = pdf
+            msg_cache[ticker]   = mdf
+            time.sleep(0.3)
+
+        # ── SWEEP ─────────────────────────────────────────────────
+        if opt_mode == "threshold":
+            x_values = THRESHOLD_VALUES
+            x_label  = "Entry Correlation Threshold"
+            x_fmt    = ""
+            profits  = []
+            for thresh in x_values:
+                total = sum(
+                    compute_profit_for_ticker(
+                        price_cache[t], msg_cache[t],
+                        FIXED_WINDOW_MIN, thresh, FIXED_STOP_PCT, pct_threshold
+                    )
+                    for t in tickers
+                )
+                profits.append(round(total, 2))
+                print("    threshold=" + str(thresh) + "  profit=$" + str(round(total, 2)))
+
+        elif opt_mode == "rolling window":
+            x_values = WINDOW_VALUES
+            x_label  = "Rolling Window (minutes)"
+            x_fmt    = "min"
+            profits  = []
+            for wm in x_values:
+                total = sum(
+                    compute_profit_for_ticker(
+                        price_cache[t], msg_cache[t],
+                        wm, FIXED_THRESHOLD, FIXED_STOP_PCT, pct_threshold
+                    )
+                    for t in tickers
+                )
+                profits.append(round(total, 2))
+            # Print summary every 10
+            for idx, (wm, p) in enumerate(zip(x_values, profits)):
+                if idx % 10 == 0:
+                    print("    window=" + str(wm) + "min  profit=$" + str(p))
+
+        else:  # stop loss
+            x_values = STOP_VALUES
+            x_label  = "Trailing Stop Loss (%)"
+            x_fmt    = "%"
+            profits  = []
+            for stop in x_values:
+                total = sum(
+                    compute_profit_for_ticker(
+                        price_cache[t], msg_cache[t],
+                        FIXED_WINDOW_MIN, FIXED_THRESHOLD, stop, pct_threshold
+                    )
+                    for t in tickers
+                )
+                profits.append(round(total, 2))
+                print("    stop=" + str(stop) + "%  profit=$" + str(round(total, 2)))
+
+        # ── CHART ─────────────────────────────────────────────────
+        mode_label = opt_mode.replace(" ", "_")
+        out_filename = (
+            "optimal_" + mode_label
+            + "-" + market_cap
+            + "-" + date + ".png"
+        )
+        out_path = os.path.join(DOWNLOADS_DIR, out_filename)
+
+        title = (
+            "Optimal " + opt_mode.title()
+            + " — " + market_cap.upper()
+            + " (" + date + ")"
+            + "\nFixed: window=" + str(FIXED_WINDOW_MIN) + "min"
+            + "  threshold=" + str(FIXED_THRESHOLD)
+            + "  stop=" + str(FIXED_STOP_PCT) + "%"
+        )
+
+        plot_and_save(x_values, profits, x_label, title, out_path, x_fmt)
+
+    print("\n[Done] All charts saved to: " + DOWNLOADS_DIR)
+
+
+if __name__ == "__main__":
+    main()
