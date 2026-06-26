@@ -1,0 +1,253 @@
+"""
+Sweep Results Chart
+====================
+Reads sweep CSVs from ~/Downloads for a given date + market cap,
+plots profit (entry_price * pct_change / 100 summed) on Y axis.
+
+X axis depends on mode:
+  threshold  : 0.1, 0.2 ... 1.0
+  window     : 10, 20 ... 960 min
+  stop loss  : 5, 10, 15, 20, 25, 30 %
+
+File naming conventions recognised:
+  2026-06-24-threshold0_4-micro.csv        (threshold sweep)
+  2026-06-24-window360min-...-micro.csv    (window sweep)
+  2026-06-24-stop20pct-micro.csv           (stop loss sweep)
+
+Usage:
+    python plot_sweep_results.py
+"""
+
+import os
+import re
+
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+
+
+# ---------------------------------------------------------------------------
+# Profit calculation — same as original chart script
+# ---------------------------------------------------------------------------
+
+def calc_profit(path):
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return 0.0, 0
+    if df.empty or "pct_change" not in df.columns or "entry_price" not in df.columns:
+        return 0.0, 0
+    df = df.dropna(subset=["pct_change", "entry_price"])
+    profit = (df["entry_price"] * df["pct_change"] / 100).sum()
+    return round(profit, 2), len(df)
+
+
+# ---------------------------------------------------------------------------
+# File finders
+# ---------------------------------------------------------------------------
+
+def find_threshold_files(date, market_cap):
+    """
+    Match: {date}-threshold{val}-{market_cap}.csv
+    Example:
+        2026-06-24-threshold0.4-mega.csv
+    """
+    results = {}
+    pat = re.compile(
+        r"^" + re.escape(date) + r"-threshold([\d.]+)-" + re.escape(market_cap) + r"\.csv$"
+    )
+
+    for f in os.listdir(DOWNLOADS_DIR):
+        m = pat.match(f)
+        if m:
+            try:
+                val = round(float(m.group(1)), 1)
+                results[val] = os.path.join(DOWNLOADS_DIR, f)
+            except ValueError:
+                pass
+
+    return results
+
+
+def find_window_files(date, market_cap):
+    """
+    Match: {date}-window{N}min-{market_cap}.csv
+    Example:
+        2026-06-24-window890min-mid.csv
+    """
+    results = {}
+    pat = re.compile(
+        r"^" + re.escape(date) + r"-window(\d+)min-" + re.escape(market_cap) + r"\.csv$"
+    )
+
+    for f in os.listdir(DOWNLOADS_DIR):
+        m = pat.match(f)
+        if m:
+            val = int(m.group(1))
+            results[val] = os.path.join(DOWNLOADS_DIR, f)
+
+    return results
+
+
+def find_stop_files(date, market_cap):
+    """
+    Match: {date}-stop{N}pct-{market_cap}.csv  OR
+           {date}-stop{N}pct-...-{market_cap}.csv
+    """
+    results = {}
+    pat = re.compile(
+        r"^" + re.escape(date) + r"-stop(\d+)pct(?:-.+)?-" + re.escape(market_cap) + r"\.csv$"
+    )
+    for f in os.listdir(DOWNLOADS_DIR):
+        m = pat.match(f)
+        if m:
+            val = int(m.group(1))
+            results[val] = os.path.join(DOWNLOADS_DIR, f)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Plot
+# ---------------------------------------------------------------------------
+
+def plot_chart(x_values, profits, trade_counts,
+               x_label, x_fmt, title, out_path):
+
+    fig, ax1 = plt.subplots(figsize=(14, 6))
+
+    color_profit = "#2196F3"
+    ax1.plot(x_values, profits, color=color_profit, linewidth=2.5,
+             marker="o", markersize=5, label="Total Profit ($)")
+    ax1.fill_between(x_values, profits, alpha=0.08, color=color_profit)
+    ax1.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax1.set_xlabel(x_label, fontsize=12)
+    ax1.set_ylabel("Total Profit ($)", fontsize=12, color=color_profit)
+    ax1.tick_params(axis="y", labelcolor=color_profit)
+    ax1.yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda v, _: "${:,.0f}".format(v))
+    )
+
+    # Best marker
+    if profits:
+        best_idx    = profits.index(max(profits))
+        best_x      = x_values[best_idx]
+        best_profit = profits[best_idx]
+        ax1.annotate(
+            "Best: " + str(best_x) + x_fmt + "\n$" + "{:,.2f}".format(best_profit),
+            xy=(best_x, best_profit),
+            xytext=(best_x, best_profit * 0.80),
+            arrowprops=dict(arrowstyle="->", color="black"),
+            fontsize=10, color="black",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.9),
+        )
+
+    # Trade count bars
+    ax2 = ax1.twinx()
+    color_trades = "#E91E63"
+    bar_width = (x_values[-1] - x_values[0]) / len(x_values) * 0.6 if len(x_values) > 1 else 0.5
+    ax2.bar(x_values, trade_counts, width=bar_width,
+            alpha=0.18, color=color_trades, label="# Trades")
+    ax2.set_ylabel("Number of Trades", fontsize=12, color=color_trades)
+    ax2.tick_params(axis="y", labelcolor=color_trades)
+
+    plt.title(title, fontsize=14, fontweight="bold", pad=15)
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=10)
+
+    ax1.set_xticks(x_values)
+    ax1.set_xticklabels(
+        [str(x) + x_fmt for x in x_values],
+        rotation=45, ha="right", fontsize=9
+    )
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: " + os.path.basename(out_path))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    print("\n" + "=" * 60)
+    print("  Sweep Results Chart Generator")
+    print("=" * 60)
+
+    valid_modes = ("threshold", "window", "stop loss")
+    mode = ""
+    while mode not in valid_modes:
+        mode = input(
+            "\nWhat did you sweep? (threshold / window / stop loss): "
+        ).strip().lower()
+
+    date = input("Date (YYYY-MM-DD): ").strip()
+
+    valid_caps = ["nano", "micro", "small", "mid", "large", "mega"]
+
+    print("\nGenerating charts for all market caps found in ~/Downloads...")
+
+    any_found = False
+
+    for market_cap in valid_caps:
+
+        if mode == "threshold":
+            file_map   = find_threshold_files(date, market_cap)
+            x_label    = "Entry Correlation Threshold"
+            x_fmt      = ""
+            mode_label = "threshold"
+        elif mode == "window":
+            file_map   = find_window_files(date, market_cap)
+            x_label    = "Rolling Window Size (minutes)"
+            x_fmt      = "min"
+            mode_label = "window"
+        else:
+            file_map   = find_stop_files(date, market_cap)
+            x_label    = "Trailing Stop Loss (%)"
+            x_fmt      = "%"
+            mode_label = "stoploss"
+
+        if not file_map:
+            print("  [" + market_cap + "] No files found — skipping.")
+            continue
+
+        any_found = True
+        x_values     = sorted(file_map.keys())
+        profits      = []
+        trade_counts = []
+
+        for x in x_values:
+            p, tc = calc_profit(file_map[x])
+            profits.append(p)
+            trade_counts.append(tc)
+            print("  [" + market_cap + "] " + x_label + "=" + str(x) + x_fmt
+                  + "  trades=" + str(tc) + "  profit=$" + str(p))
+
+        title = (
+            "Total Profit vs " + x_label
+            + " — " + market_cap.upper()
+            + " (" + date + ")"
+        )
+        out_filename = (
+            "sweep_" + mode_label
+            + "_" + market_cap
+            + "_" + date + ".png"
+        )
+        out_path = os.path.join(DOWNLOADS_DIR, out_filename)
+        plot_chart(x_values, profits, trade_counts,
+                   x_label, x_fmt, title, out_path)
+
+    if not any_found:
+        print("\nNo matching files found in ~/Downloads for date: " + date)
+        print("Make sure parameter_sweep.py has been run first.")
+
+
+if __name__ == "__main__":
+    main()
