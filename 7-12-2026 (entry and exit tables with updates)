@@ -42,7 +42,7 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # ---------------------------------------------------------------------------
 
-AUTH_TOKEN    = "7d37c9d3-2fd2-4769-8d62-29133fcbe3a6"
+AUTH_TOKEN    = "1359238a-1950-4c6c-adaa-1d4145d985ca"
 DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 EST           = pytz.timezone("America/New_York")
 
@@ -384,96 +384,50 @@ def run_for_window(tickers, price_cache, msg_cache, date,
 # MAIN
 # ---------------------------------------------------------------------------
 
-def main():
-    print("\n" + "=" * 60)
-    print("  Parameter Sweep Optimizer (Density Only)")
-    print("=" * 60)
+def detect_market_cap(csv_path):
+    """Detect market cap from filename (e.g. nano_first_2026-07-13.csv -> nano)."""
+    fname = os.path.basename(csv_path).lower()
+    for cap in ["nano", "micro", "small", "mid", "large", "mega"]:
+        if fname.startswith(cap):
+            return cap
+    return None
 
-    opt_mode = ""
-    while opt_mode not in ("threshold", "window", "stop loss"):
-        opt_mode = input(
-            "\nWhat are you optimizing? (threshold / window / stop loss): "
-        ).strip().lower()
 
-    date = input("Date (YYYY-MM-DD): ").strip()
-
-    valid_caps = ["nano", "micro", "small", "mid", "large", "mega"]
-    market_cap = ""
-    while market_cap not in valid_caps:
-        market_cap = input("Market cap (nano/micro/small/mid/large/mega): ").strip().lower()
-
-    csv_path = input("Path to ticker CSV file: ").strip().strip("'\"")
-    if not os.path.exists(csv_path):
-        print("File not found: " + csv_path)
-        sys.exit(1)
+def load_tickers(csv_path):
     df_src  = pd.read_csv(csv_path)
     col_map = {c.strip().lower(): c for c in df_src.columns}
     if "ticker" not in col_map:
-        print("No Ticker column found. Columns: " + str(df_src.columns.tolist()))
-        sys.exit(1)
-    tickers = df_src[col_map["ticker"]].dropna().astype(str).str.strip().tolist()
-    print("Loaded " + str(len(tickers)) + " tickers: " + str(tickers))
+        print("  No Ticker column in: " + csv_path)
+        return []
+    return df_src[col_map["ticker"]].dropna().astype(str).str.strip().tolist()
 
-    # Fetch all data once
-    print("\nFetching price & message data...")
-    price_cache = {}
-    msg_cache   = {}
-    for ticker in tickers:
-        print("  [" + ticker + "] fetching...")
-        price_cache[ticker] = get_price_data(ticker, date)
-        msg_cache[ticker]   = fetch_stocktwits_messages(ticker, date)
-        msgs = int(msg_cache[ticker]["total"].sum()) if not msg_cache[ticker].empty else 0
-        print("    price_rows=" + str(len(price_cache[ticker])) + "  messages=" + str(msgs))
-        time.sleep(0.4)
 
-    # Set up sweep
-    if opt_mode == "threshold":
-        sweep_values   = THRESHOLD_VALUES
-        window_minutes = FIXED_WINDOW_MIN
-        trailing_stop  = FIXED_STOP_PCT
-        print("\nSweeping threshold: " + str(sweep_values))
-        print("Fixed: window=" + str(window_minutes) + "min  stop=" + str(trailing_stop) + "%")
+def run_sweep_for_cap(market_cap, tickers, price_cache, msg_cache,
+                      date, opt_mode, sweep_values,
+                      window_minutes, trailing_stop, entry_corr, out_dir):
+    """Run the full sweep for one market cap and save CSVs."""
+    print("\n" + "─" * 50)
+    print("  Market cap: " + market_cap.upper() + "  (" + str(len(tickers)) + " tickers)")
 
-    elif opt_mode == "window":
-        sweep_values  = WINDOW_VALUES
-        entry_corr    = FIXED_THRESHOLD
-        trailing_stop = FIXED_STOP_PCT
-        print("\nSweeping window: 10 → 960 min (" + str(len(sweep_values)) + " values)")
-        print("Fixed: threshold=" + str(entry_corr) + "  stop=" + str(trailing_stop) + "%")
-
-    else:  # stop loss
-        sweep_values   = STOP_VALUES
-        entry_corr     = FIXED_THRESHOLD
-        window_minutes = FIXED_WINDOW_MIN
-        print("\nSweeping stop loss: " + str(sweep_values))
-        print("Fixed: threshold=" + str(entry_corr) + "  window=" + str(window_minutes) + "min")
-
-    # Output subfolder
-    out_dir = os.path.join(DOWNLOADS_DIR, opt_mode)
-    os.makedirs(out_dir, exist_ok=True)
-    print("\nOutput folder: " + out_dir)
-
-    # Run sweep
-    print("Running sweep...")
     for val in sweep_values:
         if opt_mode == "threshold":
-            entry_corr = val
-            wm         = window_minutes
-            stop       = trailing_stop
-            label      = "threshold" + str(val)
+            ec    = val
+            wm    = window_minutes
+            stop  = trailing_stop
+            label = "threshold" + str(val)
         elif opt_mode == "window":
+            ec    = entry_corr
             wm    = val
             stop  = trailing_stop
             label = "window" + str(val) + "min"
         else:
-            stop       = val
-            wm         = window_minutes
-            entry_corr = FIXED_THRESHOLD
-            label      = "stop" + str(val) + "pct"
+            ec    = entry_corr
+            wm    = window_minutes
+            stop  = val
+            label = "stop" + str(val) + "pct"
 
         df_result = run_for_window(
-            tickers, price_cache, msg_cache, date,
-            wm, entry_corr, stop,
+            tickers, price_cache, msg_cache, date, wm, ec, stop,
         )
 
         out_filename = date + "-" + label + "-" + market_cap + ".csv"
@@ -496,6 +450,130 @@ def main():
                 "total_msgs_in_trade", "exit_reason",
             ]).to_csv(out_path, index=False)
             print("  " + label + " -> 0 trades  [" + out_filename + "]")
+
+
+def main():
+    print("\n" + "=" * 60)
+    print("  Parameter Sweep Optimizer (Density Only)")
+    print("=" * 60)
+
+    opt_mode = ""
+    while opt_mode not in ("threshold", "window", "stop loss"):
+        opt_mode = input(
+            "\nWhat are you optimizing? (threshold / window / stop loss): "
+        ).strip().lower()
+
+    date = input("Date (YYYY-MM-DD): ").strip()
+
+    # ── Collect CSV paths for all 6 market caps ──────────────────────────────
+    print("\nPaste paths to your 6 ticker CSVs (nano, micro, small, mid, large, mega).")
+    print("You can paste them all at once or one per line. Enter a blank line when done.\n")
+
+    raw_input_lines = []
+    while True:
+        line = input().strip()
+        if line == "":
+            if raw_input_lines:
+                break
+            continue
+        raw_input_lines.append(line)
+
+    # Split on whitespace between quoted paths or just collect all tokens
+    import shlex
+    all_tokens = []
+    for line in raw_input_lines:
+        try:
+            all_tokens.extend(shlex.split(line))
+        except ValueError:
+            # fallback: split on quote boundaries
+            all_tokens.extend([t.strip().strip("'\"") for t in line.split('"') if t.strip()])
+
+    # Clean up paths
+    csv_paths = [t.strip().strip("'\"") for t in all_tokens if t.strip()]
+
+    # Build market_cap → (path, tickers) map, auto-detecting cap from filename
+    valid_caps  = ["nano", "micro", "small", "mid", "large", "mega"]
+    cap_data    = {}   # cap -> list of tickers
+    cap_paths   = {}   # cap -> path (for logging)
+
+    for path in csv_paths:
+        path = path.strip()
+        if not os.path.exists(path):
+            print("  [!] File not found, skipping: " + path)
+            continue
+        cap = detect_market_cap(path)
+        if cap is None:
+            print("  [!] Cannot detect market cap from filename, skipping: " + path)
+            continue
+        tickers = load_tickers(path)
+        if not tickers:
+            print("  [!] No tickers found in: " + path)
+            continue
+        cap_data[cap]  = tickers
+        cap_paths[cap] = path
+        print("  [" + cap + "] " + str(len(tickers)) + " tickers from: " + os.path.basename(path))
+
+    if not cap_data:
+        print("No valid CSV files found. Exiting.")
+        sys.exit(1)
+
+    # ── Set up sweep values ───────────────────────────────────────────────────
+    if opt_mode == "threshold":
+        sweep_values   = THRESHOLD_VALUES
+        window_minutes = FIXED_WINDOW_MIN
+        trailing_stop  = FIXED_STOP_PCT
+        entry_corr     = FIXED_THRESHOLD   # placeholder, overridden per val
+        print("\nSweeping threshold: " + str(sweep_values))
+        print("Fixed: window=" + str(window_minutes) + "min  stop=" + str(trailing_stop) + "%")
+
+    elif opt_mode == "window":
+        sweep_values   = WINDOW_VALUES
+        entry_corr     = FIXED_THRESHOLD
+        trailing_stop  = FIXED_STOP_PCT
+        window_minutes = FIXED_WINDOW_MIN  # placeholder, overridden per val
+        print("\nSweeping window: 10 → 960 min (" + str(len(sweep_values)) + " values)")
+        print("Fixed: threshold=" + str(entry_corr) + "  stop=" + str(trailing_stop) + "%")
+
+    else:  # stop loss
+        sweep_values   = STOP_VALUES
+        entry_corr     = FIXED_THRESHOLD
+        window_minutes = FIXED_WINDOW_MIN
+        trailing_stop  = FIXED_STOP_PCT    # placeholder, overridden per val
+        print("\nSweeping stop loss: " + str(sweep_values))
+        print("Fixed: threshold=" + str(entry_corr) + "  window=" + str(window_minutes) + "min")
+
+    # Output subfolder inside Downloads
+    out_dir = os.path.join(DOWNLOADS_DIR, opt_mode)
+    os.makedirs(out_dir, exist_ok=True)
+    print("\nOutput folder: " + out_dir)
+
+    # ── Process each market cap ───────────────────────────────────────────────
+    for cap in valid_caps:
+        if cap not in cap_data:
+            print("\n  [" + cap + "] No CSV provided — skipping.")
+            continue
+
+        tickers = cap_data[cap]
+
+        # Fetch price + message data once per cap
+        print("\n  [" + cap + "] Fetching price & message data for "
+              + str(len(tickers)) + " tickers...")
+        price_cache = {}
+        msg_cache   = {}
+        for ticker in tickers:
+            price_cache[ticker] = get_price_data(ticker, date)
+            msg_cache[ticker]   = fetch_stocktwits_messages(ticker, date)
+            msgs = int(msg_cache[ticker]["total"].sum()) if not msg_cache[ticker].empty else 0
+            print("    " + ticker
+                  + " -> price_rows=" + str(len(price_cache[ticker]))
+                  + "  messages=" + str(msgs))
+            time.sleep(0.4)
+
+        run_sweep_for_cap(
+            cap, tickers, price_cache, msg_cache,
+            date, opt_mode, sweep_values,
+            window_minutes, trailing_stop, entry_corr, out_dir,
+        )
 
     print("\n[Done] All files saved to: " + out_dir)
 
