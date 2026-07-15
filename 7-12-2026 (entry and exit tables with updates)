@@ -42,7 +42,7 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # ---------------------------------------------------------------------------
 
-AUTH_TOKEN    = "1359238a-1950-4c6c-adaa-1d4145d985ca"
+AUTH_TOKEN    = "01a793c0-1578-468a-ad31-c23d9bbea50a"
 DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 EST           = pytz.timezone("America/New_York")
 
@@ -318,9 +318,12 @@ def find_trade_signals(ticker, all_windows, entry_corr_threshold, trailing_stop_
                 "exit_reason":              exit_reason,
             })
 
-        # Resume from the window after exit — can re-enter on a new move
-        # but cannot overlap with the trade that just closed
+        # Skip forward to the first window whose start time >= exit window's end time
+        # This prevents any time-overlapping re-entry since windows slide 1 min at a time
+        exit_end_time = exit_w["w_end"]
         i = exit_idx + 1
+        while i < len(all_windows) and all_windows[i]["w_start"] < exit_end_time:
+            i += 1
 
     return trades
 
