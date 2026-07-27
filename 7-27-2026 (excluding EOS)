@@ -1,0 +1,876 @@
+"""
+Parameter Sweep — Rolling Window / Threshold / Stop Loss
+=========================================================
+Entry/exit hybrid signal:
+  Entry (unchanged):
+    1. Price rising
+    2. MACD(msg_per_min, 12,26,9) crosses above Signal AND MACD > 0
+    3. Normalised sentiment > 0 (net bullish)
+    4. Price-density correlation >= threshold (optional filter)
+
+  Exit (message-density trailing stop ONLY):
+    Track the peak message density (msg_per_min) reached since entry.
+    Exit the first window whose msg_per_min falls below
+    peak_density * (1 - stop_pct/100).
+    MACD cross-down, sentiment<=0, and price-falling no longer close trades
+    on their own — they are computed/reported but not used as exits.
+
+Requirements:
+    pip install curl_cffi pandas scipy pytz matplotlib
+
+Per-cap fixed windows (when not sweeping window):
+  nano  :  60 min
+  micro :  60 min
+  small : 120 min
+  mid   : 120 min
+  large : 360 min
+  mega  : 360 min
+
+Sweeps:
+  threshold    : 0.1 → 1.0  (step 0.1)
+  rolling window: 10 → 960  (step 10)
+  stop loss    : 10, 20, 30 ... 100%
+"""
+
+import os
+import sys
+import time
+import math
+import shlex
+import warnings
+from datetime import datetime
+from io import StringIO
+
+import pandas as pd
+import pytz
+from curl_cffi import requests as curl_requests
+from scipy.stats import pearsonr
+
+import matplotlib
+matplotlib.use("Agg")  # safe headless backend; still saves PNGs fine when run in PyCharm
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+AUTH_TOKEN    = "8227e8a9-6df2-46a8-a94c-c9fd6e4ee511"
+DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+EST           = pytz.timezone("America/New_York")
+
+# Fixed window per market cap (used when not sweeping window)
+FIXED_WINDOW_BY_CAP = {
+    "nano":  60,
+    "micro": 60,
+    "small": 120,
+    "mid":   120,
+    "large": 360,
+    "mega":  360,
+}
+
+FIXED_THRESHOLD = 0.3
+FIXED_STOP_PCT  = 30.0
+
+THRESHOLD_VALUES = [round(x * 0.1, 1) for x in range(1, 11)]   # 0.1 … 1.0
+WINDOW_VALUES    = list(range(10, 970, 10))                       # 10 … 960
+STOP_VALUES      = list(range(10, 110, 10))                       # 10, 20 … 100
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+def curl_get(url, params=None, timeout=30):
+    return curl_requests.get(
+        url, params=params, timeout=timeout,
+        impersonate="chrome110",
+        headers={"User-Agent": "Mozilla/5.0"},
+        allow_redirects=True,
+    )
+
+# ---------------------------------------------------------------------------
+# PRICE DATA
+# ---------------------------------------------------------------------------
+
+def get_price_data(ticker, date):
+    url = (
+        "https://elite.finviz.com/quote_export?"
+        "t=" + ticker + "&p=i1&s=" + date + "&e=" + date + "&auth=" + AUTH_TOKEN
+    )
+    try:
+        resp = curl_get(url, timeout=30)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        df = pd.read_csv(StringIO(resp.text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        dt_col = next((c for c in df.columns if "date" in c or "time" in c), None)
+        if dt_col is None:
+            return pd.DataFrame()
+        df[dt_col] = df[dt_col].astype(str).str.replace(r"\s+(AM|PM)$", "", regex=True)
+        df[dt_col] = pd.to_datetime(df[dt_col], format="%m/%d/%Y %H:%M", errors="coerce")
+        df = df.dropna(subset=[dt_col]).rename(columns={dt_col: "datetime"})
+        if df["datetime"].dt.tz is None:
+            df["datetime"] = df["datetime"].dt.tz_localize(EST)
+        return df[["datetime", "close"]].sort_values("datetime").reset_index(drop=True)
+    except Exception as e:
+        print("    Price fetch error for " + ticker + ": " + str(e))
+        return pd.DataFrame()
+
+# ---------------------------------------------------------------------------
+# STOCKTWITS — fetch bull/bear/total per message
+# ---------------------------------------------------------------------------
+
+def fetch_stocktwits_messages(ticker, date):
+    base      = "https://api.stocktwits.com/api/2/streams/symbol/" + ticker + ".json"
+    date_dt   = datetime.strptime(date, "%Y-%m-%d")
+    day_start = EST.localize(date_dt.replace(hour=0,  minute=0,  second=0))
+    day_end   = EST.localize(date_dt.replace(hour=23, minute=59, second=59))
+    rows, max_id, stop, page = [], None, False, 0
+
+    while not stop and page < 40:
+        params = {"limit": 30}
+        if max_id:
+            params["max"] = max_id
+        try:
+            resp = curl_get(base, params=params, timeout=20)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+        except Exception:
+            break
+        messages = data.get("messages", [])
+        if not messages:
+            break
+        for msg in messages:
+            raw_ts = msg.get("created_at", "")
+            try:
+                ts_utc = datetime.strptime(raw_ts, "%Y-%m-%dT%H:%M:%SZ")
+                ts_utc = pytz.utc.localize(ts_utc)
+                ts_est = ts_utc.astimezone(EST)
+            except Exception:
+                continue
+            if ts_est < day_start:
+                stop = True
+                break
+            if ts_est > day_end:
+                continue
+            sentiment = (msg.get("entities") or {}).get("sentiment") or {}
+            label  = (sentiment.get("basic") or "").lower()
+            bull   = 1 if label == "bullish" else 0
+            bear   = 1 if label == "bearish" else 0
+            tagged = 1 if label in ("bullish", "bearish") else 0
+            rows.append({"datetime": ts_est, "bull": bull, "bear": bear,
+                         "tagged": tagged, "total": 1})
+        max_id = messages[-1].get("id")
+        page  += 1
+        time.sleep(0.3)
+
+    if not rows:
+        return pd.DataFrame(columns=["datetime", "bull", "bear", "tagged", "total"])
+    return pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
+def hhmm_to_minutes(hhmm):
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+
+def build_rolling_windows(start_hhmm, end_hhmm, window_minutes, date):
+    base      = datetime.strptime(date, "%Y-%m-%d")
+    start_min = hhmm_to_minutes(start_hhmm)
+    end_min   = hhmm_to_minutes(end_hhmm)
+    windows, cur = [], start_min
+    while cur + window_minutes <= end_min + 1:
+        ws = EST.localize(base.replace(hour=cur // 60, minute=cur % 60, second=0))
+        we = EST.localize(base.replace(
+            hour=(cur + window_minutes) // 60,
+            minute=(cur + window_minutes) % 60, second=0))
+        windows.append((ws, we))
+        cur += 1   # overlapping: slide 1 minute at a time
+    return windows
+
+
+def safe_corr(x, y):
+    pairs = [(a, b) for a, b in zip(x, y)
+             if not math.isnan(a) and not math.isnan(b)]
+    if len(pairs) < 3:
+        return float("nan")
+    xs, ys = zip(*pairs)
+    try:
+        r, _ = pearsonr(xs, ys)
+        return r
+    except Exception:
+        return float("nan")
+
+
+def calc_normalised_sentiment(bull, bear, tagged, total, max_weight):
+    """
+    Normalised sentiment score. Positive = net bullish, negative = net bearish.
+    Returns nan when no tagged messages or max_weight is 0.
+    """
+    if tagged == 0 or max_weight == 0:
+        return float("nan")
+    raw = (bull - bear) / tagged * math.log(1 + total)
+    return raw / max_weight
+
+
+def calc_macd(values, fast=12, slow=26, signal=9):
+    """
+    Calculate MACD (fast EMA - slow EMA) and Signal line (EMA of MACD)
+    on a list of floats. Returns (macd_line, signal_line, histogram) as lists.
+    nan-safe: windows with nan density are treated as 0 for EMA purposes.
+    """
+    n = len(values)
+    # Replace nan with 0 for EMA calculation
+    v = [x if not math.isnan(x) else 0.0 for x in values]
+
+    def ema(data, period):
+        k  = 2.0 / (period + 1)
+        result = [float("nan")] * len(data)
+        # seed with simple average of first `period` values
+        if len(data) < period:
+            return result
+        seed = sum(data[:period]) / period
+        result[period - 1] = seed
+        for i in range(period, len(data)):
+            result[i] = data[i] * k + result[i - 1] * (1 - k)
+        return result
+
+    ema_fast = ema(v, fast)
+    ema_slow = ema(v, slow)
+
+    macd_line = []
+    for f, s in zip(ema_fast, ema_slow):
+        if math.isnan(f) or math.isnan(s):
+            macd_line.append(float("nan"))
+        else:
+            macd_line.append(f - s)
+
+    # Signal = EMA of macd_line (only over non-nan values)
+    macd_for_signal = [x if not math.isnan(x) else 0.0 for x in macd_line]
+    signal_line_raw = ema(macd_for_signal, signal)
+
+    # Restore nan where macd was nan
+    signal_line = []
+    for i, s in enumerate(signal_line_raw):
+        if math.isnan(macd_line[i]):
+            signal_line.append(float("nan"))
+        else:
+            signal_line.append(s)
+
+    histogram = []
+    for m, s in zip(macd_line, signal_line):
+        if math.isnan(m) or math.isnan(s):
+            histogram.append(float("nan"))
+        else:
+            histogram.append(m - s)
+
+    return macd_line, signal_line, histogram
+
+# ---------------------------------------------------------------------------
+# TRADE SIGNAL LOGIC — MACD entry / message-density trailing-stop exit
+# Entry : price rising  AND  MACD crosses above Signal AND MACD > 0
+#         AND sentiment > 0  AND  corr >= threshold          (UNCHANGED)
+# Exit  : message density falls below (1 - stop_pct/100) of the peak
+#         message density reached since entry.                (ONLY exit)
+# No time-overlap: skip windows whose start < exit end time
+# ---------------------------------------------------------------------------
+
+def find_trade_signals(ticker, all_windows, entry_corr_threshold, trailing_stop_pct):
+    trades = []
+
+    prices     = [w["price_close"] for w in all_windows]
+    densities  = [w["msg_per_min"] for w in all_windows]
+    sentiments = [w["sentiment"]   for w in all_windows]
+
+    # Price-density correlation (lookback 10 windows) — kept as optional filter
+    corr_pd = []
+    for i in range(len(all_windows)):
+        lo = max(0, i - 9)
+        corr_pd.append(safe_corr(prices[lo:i+1], densities[lo:i+1]))
+
+    # MACD(12,26,9) on message density
+    macd_line, signal_line, histogram = calc_macd(densities, fast=12, slow=26, signal=9)
+
+    def _f(v):
+        return not math.isnan(v)
+
+    i = 0
+    while i < len(all_windows):
+        w     = all_windows[i]
+        r_pd  = corr_pd[i]
+        sent  = sentiments[i]
+        macd  = macd_line[i]
+        sig   = signal_line[i]
+        prev_macd = macd_line[i - 1] if i > 0 else float("nan")
+        prev_sig  = signal_line[i - 1] if i > 0 else float("nan")
+
+        price_rising    = (_f(w["price_open"]) and _f(w["price_close"])
+                           and w["price_close"] > w["price_open"])
+        corr_ok         = _f(r_pd) and r_pd >= entry_corr_threshold
+        sentiment_ok    = _f(sent) and sent > 0
+        # MACD crossover above signal AND MACD itself positive
+        macd_cross_up   = (_f(macd) and _f(sig) and _f(prev_macd) and _f(prev_sig)
+                           and prev_macd <= prev_sig   # was at or below
+                           and macd > sig              # now above
+                           and macd > 0)
+
+        if not (price_rising and corr_ok and sentiment_ok and macd_cross_up):
+            i += 1
+            continue
+
+        # ── ENTERED ─────────────────────────────────────────────────────────
+        entry_idx       = i
+        entry_sentiment = sent
+        entry_macd      = macd
+        entry_signal    = sig
+        peak_macd       = macd   # kept only for reporting/CSV columns, not used for exits
+        # Peak MESSAGE DENSITY since entry — this is what the trailing stop now tracks.
+        # Seed it with the entry window's own density (0.0 if somehow nan) so the
+        # very first comparison is meaningful even on a 1-window-old trade.
+        entry_density   = densities[entry_idx]
+        peak_density    = entry_density if _f(entry_density) else 0.0
+        exit_idx        = None
+        exit_reason     = None
+
+        j = i + 1
+        while j < len(all_windows):
+            wj       = all_windows[j]
+            macd_j   = macd_line[j]
+            density_j = densities[j]
+
+            # Update peak MACD (reporting only — no longer an exit trigger)
+            if _f(macd_j):
+                peak_macd = max(peak_macd, macd_j)
+
+            # Update peak message density seen so far during this trade
+            if _f(density_j):
+                peak_density = max(peak_density, density_j)
+
+            # ONLY exit condition: message density falls below
+            # (1 - stop_pct/100) of the peak density reached since entry.
+            # e.g. 30% stop, peak density = 100 -> exit when density < 70.
+            trailing_stop_hit = False
+            if trailing_stop_pct is not None and _f(density_j) and peak_density > 0:
+                stop_fraction     = trailing_stop_pct / 100.0
+                trailing_stop_hit = density_j < peak_density * (1 - stop_fraction)
+
+            if trailing_stop_hit:
+                exit_idx    = j
+                exit_reason = "density_trailing_stop_" + str(trailing_stop_pct) + "pct"
+                break
+
+            j += 1
+
+        if exit_idx is None:
+            exit_idx    = len(all_windows) - 1
+            exit_reason = "end_of_session"
+
+        if exit_idx == entry_idx:
+            i += 1
+            continue
+
+        entry_w        = all_windows[entry_idx]
+        exit_w         = all_windows[exit_idx]
+        entry_price    = entry_w["price_open"]
+        exit_price     = exit_w["price_close"]
+        exit_sentiment = sentiments[exit_idx]
+        exit_macd      = macd_line[exit_idx]
+        exit_signal    = signal_line[exit_idx]
+        exit_hist      = histogram[exit_idx]
+
+        if entry_price and entry_price != 0 and _f(entry_price) and _f(exit_price):
+            pct_change    = (exit_price - entry_price) / entry_price * 100
+            trade_windows = all_windows[entry_idx:exit_idx + 1]
+            total_m       = sum(tw["total_msgs"] for tw in trade_windows)
+            avg_mpm       = sum(tw["msg_per_min"] for tw in trade_windows) / len(trade_windows)
+
+            trades.append({
+                "ticker":                   ticker,
+                "entry_window":             entry_w["w_start"].strftime("%H:%M"),
+                "exit_window":              exit_w["w_end"].strftime("%H:%M"),
+                "entry_price":              round(entry_price, 4),
+                "exit_price":               round(exit_price,  4),
+                "pct_change":               round(pct_change,  4),
+                "entry_corr_price_density": round(r_pd, 4)            if _f(r_pd)            else None,
+                "exit_corr_price_density":  round(corr_pd[exit_idx],4) if _f(corr_pd[exit_idx]) else None,
+                "entry_macd":               round(entry_macd, 6)      if _f(entry_macd)      else None,
+                "exit_macd":                round(exit_macd,  6)      if _f(exit_macd)       else None,
+                "entry_signal":             round(entry_signal, 6)    if _f(entry_signal)    else None,
+                "exit_signal":              round(exit_signal,  6)    if _f(exit_signal)     else None,
+                "exit_histogram":           round(exit_hist,   6)     if _f(exit_hist)       else None,
+                "peak_macd":                round(peak_macd,   6)     if _f(peak_macd)       else None,
+                "entry_sentiment":          round(entry_sentiment, 4) if _f(entry_sentiment) else None,
+                "exit_sentiment":           round(exit_sentiment,  4) if _f(exit_sentiment)  else None,
+                "avg_msg_per_min":          round(avg_mpm, 4),
+                "total_msgs_in_trade":      total_m,
+                "entry_msg_density":        round(entry_density, 6)  if _f(entry_density)   else None,
+                "peak_msg_density":         round(peak_density,  6)  if _f(peak_density)    else None,
+                "exit_msg_density":         round(densities[exit_idx], 6) if _f(densities[exit_idx]) else None,
+                "exit_reason":              exit_reason,
+            })
+
+        # Skip forward past all windows overlapping this trade's exit time
+        exit_end_time = exit_w["w_end"]
+        i = exit_idx + 1
+        while i < len(all_windows) and all_windows[i]["w_start"] < exit_end_time:
+            i += 1
+
+    return trades
+
+# ---------------------------------------------------------------------------
+# BUILD WINDOW DATA FOR ONE TICKER
+# ---------------------------------------------------------------------------
+
+def run_for_window(tickers, price_cache, msg_cache, date,
+                   window_minutes, entry_corr_threshold, trailing_stop_pct):
+
+    windows_meta = build_rolling_windows("04:00", "20:00", window_minutes, date)
+    all_trades   = []
+
+    for ticker in tickers:
+        price_df = price_cache.get(ticker, pd.DataFrame())
+        msg_df   = msg_cache.get(ticker, pd.DataFrame())
+
+        if price_df.empty:
+            continue
+        if msg_df.empty or int(msg_df["total"].sum()) == 0:
+            continue
+
+        # Aggregate per-window message counts + sentiment
+        all_msg_windows = []
+        for ws, we in windows_meta:
+            m   = msg_df[(msg_df["datetime"] >= ws) & (msg_df["datetime"] < we)]
+            b   = int(m["bull"].sum())   if not m.empty else 0
+            br  = int(m["bear"].sum())   if not m.empty else 0
+            t   = int(m["tagged"].sum()) if not m.empty else 0
+            tot = int(m["total"].sum())  if not m.empty else 0
+            all_msg_windows.append((b, br, t, tot))
+
+        # Global max_weight for normalisation across the day
+        max_weight = max(
+            (abs((b - br) / t * math.log(1 + tot))
+             for b, br, t, tot in all_msg_windows if t > 0),
+            default=1.0,
+        )
+
+        # Build per-window data
+        window_data = []
+        for (ws, we), (b, br, t, tot) in zip(windows_meta, all_msg_windows):
+            p   = price_df[(price_df["datetime"] >= ws) & (price_df["datetime"] < we)]
+            po  = p["close"].iloc[0]  if len(p) >= 1 else float("nan")
+            pc  = p["close"].iloc[-1] if len(p) >= 1 else float("nan")
+            mpm = tot / window_minutes
+            sent = calc_normalised_sentiment(b, br, t, tot, max_weight)
+            window_data.append({
+                "w_start":     ws,
+                "w_end":       we,
+                "price_open":  po,
+                "price_close": pc,
+                "total_msgs":  tot,
+                "msg_per_min": mpm,
+                "sentiment":   sent,
+            })
+
+        trades = find_trade_signals(ticker, window_data,
+                                    entry_corr_threshold, trailing_stop_pct)
+        all_trades.extend(trades)
+
+    if not all_trades:
+        return pd.DataFrame()
+    return pd.DataFrame(all_trades).reset_index(drop=True)
+
+# ---------------------------------------------------------------------------
+# HELPERS — detect cap / load tickers
+# ---------------------------------------------------------------------------
+
+def detect_market_cap(csv_path):
+    fname = os.path.basename(csv_path).lower()
+    for cap in ["nano", "micro", "small", "mid", "large", "mega"]:
+        if fname.startswith(cap):
+            return cap
+    return None
+
+
+def trade_duration_minutes(entry_hhmm, exit_hhmm):
+    """Duration in minutes between entry_window and exit_window ('HH:MM' strings)."""
+    try:
+        return hhmm_to_minutes(exit_hhmm) - hhmm_to_minutes(entry_hhmm)
+    except Exception:
+        return float("nan")
+
+
+def load_tickers(csv_path):
+    df_src  = pd.read_csv(csv_path)
+    col_map = {c.strip().lower(): c for c in df_src.columns}
+    if "ticker" not in col_map:
+        print("  No Ticker column in: " + csv_path)
+        return []
+    return df_src[col_map["ticker"]].dropna().astype(str).str.strip().tolist()
+
+# ---------------------------------------------------------------------------
+# RUN SWEEP FOR ONE MARKET CAP
+# ---------------------------------------------------------------------------
+
+EMPTY_COLS = [
+    "ticker", "entry_window", "exit_window", "entry_price", "exit_price",
+    "pct_change", "entry_corr_price_density", "exit_corr_price_density",
+    "entry_macd", "exit_macd", "entry_signal", "exit_signal",
+    "exit_histogram", "peak_macd",
+    "entry_sentiment", "exit_sentiment",
+    "avg_msg_per_min", "total_msgs_in_trade",
+    "entry_msg_density", "peak_msg_density", "exit_msg_density",
+    "exit_reason",
+]
+
+def count_exit_reasons(df_result):
+    """
+    Categorize the exit_reason column into buckets so we can see, per
+    parameter value, exactly what is actually closing trades.
+
+    NOTE: in the current strategy, macd_cross_below_signal, sentiment_negative,
+    and price_decreasing are NOT wired up as exit conditions anymore (only
+    the message-density trailing stop and end-of-session are). Those three
+    buckets are kept here so the counts can PROVE that — if this file is the
+    one actually being run, they will always read 0. Nonzero counts there
+    would mean an older version of the exit logic is executing instead.
+    """
+    counts = {
+        "trailing_stop":  0,
+        "macd_cross":     0,
+        "sentiment":      0,
+        "price_decrease": 0,
+        "end_of_session": 0,
+        "other":          0,
+    }
+    if df_result is None or df_result.empty:
+        return counts
+    for reason in df_result["exit_reason"]:
+        reason = str(reason)
+        if reason.startswith("density_trailing_stop_"):
+            counts["trailing_stop"] += 1
+        elif reason == "macd_cross_below_signal":
+            counts["macd_cross"] += 1
+        elif reason == "sentiment_negative":
+            counts["sentiment"] += 1
+        elif reason == "price_decreasing":
+            counts["price_decrease"] += 1
+        elif reason == "end_of_session":
+            counts["end_of_session"] += 1
+        else:
+            counts["other"] += 1
+    return counts
+
+
+def print_exit_reason_table(market_cap, opt_mode, reason_rows):
+    """
+    Print, for every swept parameter value, a breakdown of how many trades
+    exited via each mechanism. reason_rows is a list of dicts:
+    {"value": <param value>, **counts_dict}
+    """
+    if not reason_rows:
+        return
+    value_label = {
+        "threshold": "Threshold",
+        "window":    "Window(min)",
+    }.get(opt_mode, "Stop%")
+
+    print("\n  Exit-reason breakdown — " + market_cap.upper() + "  (" + opt_mode + " sweep)")
+    header = "  {:>12} | {:>14} | {:>10} | {:>9} | {:>14} | {:>14} | {:>7}".format(
+        value_label, "TrailingStop", "MACDcross", "Sentiment", "PriceDecrease",
+        "EndOfSession", "Other"
+    )
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for row in reason_rows:
+        print("  {:>12} | {:>14} | {:>10} | {:>9} | {:>14} | {:>14} | {:>7}".format(
+            row["value"], row["trailing_stop"], row["macd_cross"], row["sentiment"],
+            row["price_decrease"], row["end_of_session"], row["other"]
+        ))
+    print()
+
+
+def build_stoploss_summary_row(val, df_subset):
+    """Build one summary-table row (avg/median profit, trade count, avg duration) for a
+    given stop-loss value from a (possibly filtered) trades DataFrame."""
+    if df_subset is not None and not df_subset.empty:
+        durations = [
+            trade_duration_minutes(r.entry_window, r.exit_window)
+            for r in df_subset.itertuples(index=False)
+        ]
+        durations = [d for d in durations if not math.isnan(d)]
+        return {
+            "stop_pct":        val,
+            "avg_profit":      df_subset["pct_change"].mean(),
+            "median_profit":   df_subset["pct_change"].median(),
+            "num_trades":      len(df_subset),
+            "avg_duration_min": (sum(durations) / len(durations)) if durations else float("nan"),
+        }
+    return {
+        "stop_pct":        val,
+        "avg_profit":      float("nan"),
+        "median_profit":   float("nan"),
+        "num_trades":      0,
+        "avg_duration_min": float("nan"),
+    }
+
+
+def run_sweep_for_cap(market_cap, tickers, price_cache, msg_cache,
+                      date, opt_mode, sweep_values,
+                      fixed_window, trailing_stop, entry_corr, out_dir):
+    # Guarantee the folder exists right before we try to write into it
+    os.makedirs(out_dir, exist_ok=True)
+    print("\n" + "─" * 50)
+    print("  Market cap: " + market_cap.upper() + "  (" + str(len(tickers)) + " tickers)")
+
+    summary_rows      = []  # only populated/used when opt_mode == "stop loss"
+    exit_reason_rows  = []  # populated for EVERY sweep mode
+
+    for val in sweep_values:
+        if opt_mode == "threshold":
+            ec    = val
+            wm    = fixed_window
+            stop  = trailing_stop
+            label = "threshold" + str(val)
+        elif opt_mode == "window":
+            ec    = entry_corr
+            wm    = val
+            stop  = trailing_stop
+            label = "window" + str(val) + "min"
+        else:
+            ec    = entry_corr
+            wm    = fixed_window
+            stop  = val
+            label = "stop" + str(val) + "pct"
+
+        df_result = run_for_window(tickers, price_cache, msg_cache, date, wm, ec, stop)
+
+        out_filename = date + "-" + label + "-" + market_cap + ".csv"
+        out_path     = os.path.join(out_dir, out_filename)
+
+        if df_result is not None and not df_result.empty:
+            df_result.to_csv(out_path, index=False)
+            total  = len(df_result)
+            wins   = (df_result["pct_change"] > 0).sum()
+            losses = (df_result["pct_change"] <= 0).sum()
+            print("  " + label + " -> " + str(total) + " trades  "
+                  + "wins=" + str(wins) + "  losses=" + str(losses)
+                  + "  winrate=" + str(round(wins / total * 100, 1)) + "%"
+                  + "  [" + out_filename + "]")
+        else:
+            pd.DataFrame(columns=EMPTY_COLS).to_csv(out_path, index=False)
+            print("  " + label + " -> 0 trades  [" + out_filename + "]")
+
+        reason_counts = count_exit_reasons(df_result)
+        exit_reason_rows.append({"value": val, **reason_counts})
+
+        # Collect per-stop-value summary stats (only meaningful in stop-loss mode).
+        # Trades that only closed because the session ran out never actually
+        # got exercised by the trailing stop, so they're excluded here — every
+        # stop-loss graph/table reflects trailing-stop exits only.
+        if opt_mode == "stop loss":
+            if df_result is not None and not df_result.empty:
+                df_completed = df_result[df_result["exit_reason"] != "end_of_session"]
+            else:
+                df_completed = df_result
+            summary_rows.append(build_stoploss_summary_row(val, df_completed))
+
+    print_exit_reason_table(market_cap, opt_mode, exit_reason_rows)
+
+    if opt_mode == "stop loss":
+        generate_stoploss_graph_and_summary(market_cap, summary_rows, out_dir)
+
+
+def generate_stoploss_graph_and_summary(market_cap, summary_rows, out_dir):
+    """
+    Build the dual-axis stop-loss graph (avg % profit vs. # completed trades)
+    for one market cap, save it as stoploss_<cap>.png in out_dir, and print
+    a numeric validation table alongside it.
+
+    summary_rows already excludes trades that closed via end_of_session —
+    only trades actually closed by the trailing stop are reflected here.
+    """
+    if not summary_rows:
+        print("  [" + market_cap + "] No summary data to plot — skipping graph.")
+        return
+
+    summary_df = pd.DataFrame(summary_rows).sort_values("stop_pct").reset_index(drop=True)
+
+    stop_pcts   = summary_df["stop_pct"].tolist()
+    avg_profits = summary_df["avg_profit"].tolist()
+    num_trades  = summary_df["num_trades"].tolist()
+
+    fig, ax_left = plt.subplots(figsize=(9, 5.5))
+
+    color_profit = "#1f77b4"
+    color_trades = "#d62728"
+
+    ax_left.set_xlabel("Stop-Loss Percentage (%)")
+    ax_left.set_ylabel("Average Percent Profit (%)", color=color_profit)
+    line_profit, = ax_left.plot(
+        stop_pcts, avg_profits, marker="o", color=color_profit, label="Avg % Profit"
+    )
+    ax_left.tick_params(axis="y", labelcolor=color_profit)
+    ax_left.axhline(0, color="grey", linewidth=0.8, linestyle="--")
+
+    ax_right = ax_left.twinx()
+    ax_right.set_ylabel("Number of Completed Trades", color=color_trades)
+    line_trades, = ax_right.plot(
+        stop_pcts, num_trades, marker="s", color=color_trades,
+        linestyle="--", label="Completed Trades"
+    )
+    ax_right.tick_params(axis="y", labelcolor=color_trades)
+
+    ax_left.set_xticks(stop_pcts)
+    ax_left.set_title(
+        "Stop-Loss Optimization — " + market_cap.upper()
+        + " (Message-Density Trailing Stop, Trailing-Stop Exits Only)"
+    )
+    ax_left.legend(
+        handles=[line_profit, line_trades], loc="best"
+    )
+    fig.tight_layout()
+
+    png_path = os.path.join(out_dir, "stoploss_" + market_cap + ".png")
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+    print("  [" + market_cap + "] Saved graph: " + png_path)
+
+    # Validation table
+    print("\n  Validation table — " + market_cap.upper() + " (trailing-stop exits only)")
+    header = "  {:>9} | {:>12} | {:>13} | {:>8} | {:>18}".format(
+        "Stop %", "Avg Profit%", "Median Prft%", "# Trades", "Avg Duration(min)"
+    )
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for row in summary_df.itertuples(index=False):
+        avg_p = "n/a" if math.isnan(row.avg_profit) else str(round(row.avg_profit, 3))
+        med_p = "n/a" if math.isnan(row.median_profit) else str(round(row.median_profit, 3))
+        avg_d = "n/a" if math.isnan(row.avg_duration_min) else str(round(row.avg_duration_min, 1))
+        print("  {:>9} | {:>12} | {:>13} | {:>8} | {:>18}".format(
+            str(row.stop_pct) + "%", avg_p, med_p, int(row.num_trades), avg_d
+        ))
+    print()
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+def main():
+    print("\n" + "=" * 60)
+    print("  Parameter Sweep Optimizer")
+    print("=" * 60)
+
+    opt_mode = ""
+    while opt_mode not in ("threshold", "window", "stop loss"):
+        opt_mode = input(
+            "\nWhat are you optimizing? (threshold / window / stop loss): "
+        ).strip().lower()
+
+    date = input("Date (YYYY-MM-DD): ").strip()
+
+    print("\nPaste paths to your ticker CSVs (nano, micro, small, mid, large, mega).")
+    print("Paste all at once or one per line. Enter a blank line when done.\n")
+
+    raw_input_lines = []
+    while True:
+        line = input().strip()
+        if line == "":
+            if raw_input_lines:
+                break
+            continue
+        raw_input_lines.append(line)
+
+    all_tokens = []
+    for line in raw_input_lines:
+        try:
+            all_tokens.extend(shlex.split(line))
+        except ValueError:
+            all_tokens.extend([t.strip().strip("'\"") for t in line.split('"') if t.strip()])
+
+    csv_paths = [t.strip().strip("'\"") for t in all_tokens if t.strip()]
+
+    valid_caps = ["nano", "micro", "small", "mid", "large", "mega"]
+    cap_data   = {}
+
+    for path in csv_paths:
+        if not os.path.exists(path):
+            print("  [!] File not found, skipping: " + path)
+            continue
+        cap = detect_market_cap(path)
+        if cap is None:
+            print("  [!] Cannot detect market cap from filename, skipping: " + path)
+            continue
+        tickers = load_tickers(path)
+        if not tickers:
+            print("  [!] No tickers found in: " + path)
+            continue
+        cap_data[cap] = tickers
+        print("  [" + cap + "] " + str(len(tickers)) + " tickers from: " + os.path.basename(path))
+
+    if not cap_data:
+        print("No valid CSV files found. Exiting.")
+        sys.exit(1)
+
+    # Set up sweep
+    if opt_mode == "threshold":
+        sweep_values  = THRESHOLD_VALUES
+        trailing_stop = FIXED_STOP_PCT
+        entry_corr    = FIXED_THRESHOLD  # placeholder, overridden per val
+        print("\nSweeping threshold: " + str(sweep_values))
+        print("Fixed: stop=" + str(trailing_stop) + "%  window=per-cap")
+
+    elif opt_mode == "window":
+        sweep_values  = WINDOW_VALUES
+        entry_corr    = FIXED_THRESHOLD
+        trailing_stop = FIXED_STOP_PCT
+        print("\nSweeping window: 10 → 960 min (" + str(len(sweep_values)) + " values)")
+        print("Fixed: threshold=" + str(entry_corr) + "  stop=" + str(trailing_stop) + "%")
+
+    else:
+        sweep_values  = STOP_VALUES
+        entry_corr    = FIXED_THRESHOLD
+        trailing_stop = FIXED_STOP_PCT  # placeholder
+        print("\nSweeping stop loss: " + str(sweep_values))
+        print("Fixed: threshold=" + str(entry_corr) + "  window=per-cap")
+
+    out_dir = os.path.join(DOWNLOADS_DIR, opt_mode)
+    os.makedirs(out_dir, exist_ok=True)
+    print("\nOutput folder: " + out_dir)
+
+    for cap in valid_caps:
+        if cap not in cap_data:
+            print("\n  [" + cap + "] No CSV provided — skipping.")
+            continue
+
+        tickers      = cap_data[cap]
+        fixed_window = FIXED_WINDOW_BY_CAP[cap]
+
+        print("\n  [" + cap + "] Fixed window=" + str(fixed_window)
+              + "min  Fetching data for " + str(len(tickers)) + " tickers...")
+        price_cache = {}
+        msg_cache   = {}
+        for ticker in tickers:
+            price_cache[ticker] = get_price_data(ticker, date)
+            msg_cache[ticker]   = fetch_stocktwits_messages(ticker, date)
+            msgs = int(msg_cache[ticker]["total"].sum()) if not msg_cache[ticker].empty else 0
+            print("    " + ticker
+                  + " -> price_rows=" + str(len(price_cache[ticker]))
+                  + "  messages=" + str(msgs))
+            time.sleep(0.4)
+
+        run_sweep_for_cap(
+            cap, tickers, price_cache, msg_cache,
+            date, opt_mode, sweep_values,
+            fixed_window, trailing_stop, entry_corr, out_dir,
+        )
+
+    print("\n[Done] All files saved to: " + out_dir)
+
+
+if __name__ == "__main__":
+    main()
